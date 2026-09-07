@@ -6,7 +6,7 @@ Features: 3-Segment Layout, Micro-Action Badges, Context Ghost-Suggest,
 Dynamic Expanding Composer, and Interactive Settings.
 """
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 
 import os
 import sys
@@ -21,6 +21,9 @@ import fnmatch
 import argparse
 import subprocess
 import threading
+import asyncio
+import platform
+import getpass
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -53,7 +56,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl, 
 from prompt_toolkit.layout.processors import AppendAutoSuggestion
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.menus import CompletionsMenu
-from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.dimension import Dimension, to_dimension
 from prompt_toolkit.filters import has_focus
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
@@ -305,6 +308,31 @@ def notify_user_alert():
     except Exception:
         pass
 
+def get_system_environment_info() -> str:
+    """Collects comprehensive OS, shell, environment and filesystem information for the agent."""
+    is_termux = "TERMUX_VERSION" in os.environ or os.path.exists("/data/data/com.termux")
+    user = getpass.getuser() if hasattr(getpass, "getuser") else "unknown"
+    cwd = os.getcwd()
+    home = os.path.expanduser("~")
+    plat_str = f"{platform.system()} {platform.release()} ({platform.machine()})"
+    py_ver = sys.version.split()[0]
+    shell = os.environ.get("SHELL", "sh")
+
+    env_lines = [
+        f"• OS / System: {plat_str} (sys.platform: {sys.platform})",
+        f"• Platform Flavor: {'Android Termux (App Container)' if is_termux else platform.system()}",
+        f"• Current Working Directory (CWD): {cwd}",
+        f"• User Home Directory (~): {home}",
+        f"• Current User: {user}",
+        f"• Shell: {shell}",
+        f"• Python Interpreter: {py_ver} ({sys.executable})"
+    ]
+
+    if is_termux:
+        env_lines.append("• Termux Environment Notice: Running within Android Termux user space. User home is /data/data/com.termux/files/home. System root '/' and '/root' are READ-ONLY or restricted without root access. ALWAYS write project files, scripts, and logs relative to CWD or inside the user home (~).")
+
+    return "\n".join(env_lines)
+
 class BackgroundTaskManager:
     """Manages asynchronous background shell tasks."""
     def __init__(self):
@@ -502,6 +530,7 @@ class XDHarness:
         self.config = self.load_config()
         self.session_id = time.strftime("sess_%m%d_%H%M%S")
         sys_prompt = "You are xdh, an expert terminal coding agent. Be concise, precise, and practical."
+        sys_prompt += f"\n\n[Runtime & System Environment]:\n{get_system_environment_info()}"
         # Auto-detect project rules (.xdhrules or .cursorrules)
         for rf in [Path(".xdhrules"), Path(".cursorrules"), Path.home() / ".xdhrules"]:
             if rf.is_file():
@@ -1461,11 +1490,11 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write text content to a file.",
+            "description": "Write text content to a file. In Android Termux, write files relative to current working directory or inside user home directory (~), never to root / or /root.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path"},
+                    "path": {"type": "string", "description": "File path (relative to CWD or inside ~)"},
                     "content": {"type": "string", "description": "Text content"}
                 },
                 "required": ["path", "content"]
@@ -1870,12 +1899,19 @@ def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[s
 
         elif name == "write_file":
             fp = Path(args.get("path", "")).expanduser()
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            if fp.exists():
-                harness.backup_file(fp)
-            content = args.get("content", "")
-            fp.write_text(content, encoding="utf-8")
-            return f"Wrote {len(content)} characters to '{fp}'.", f"💾 Write › [bold green]{fp.name}[/bold green] [dim]({len(content)} chars)[/dim]"
+            try:
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                if fp.exists():
+                    harness.backup_file(fp)
+                content = args.get("content", "")
+                fp.write_text(content, encoding="utf-8")
+                return f"Wrote {len(content)} characters to '{fp}'.", f"💾 Write › [bold green]{fp.name}[/bold green] [dim]({len(content)} chars)[/dim]"
+            except PermissionError as pe:
+                return f"Error: Permission denied writing to '{fp}' ({pe}). On Android Termux, system roots like '/' and '/root' are read-only. Please write files relative to current working directory ({os.getcwd()}) or inside home directory (~).", f"💾 Write › [red]Permission Denied[/red]"
+            except OSError as oe:
+                if oe.errno == 30: # Read-only file system
+                    return f"Error: Read-only file system writing to '{fp}'. In Android Termux, root directories like '/root' or '/' are read-only. Please write files relative to current working directory ({os.getcwd()}) or in user home (~).", f"💾 Write › [red]Read-only Path[/red]"
+                raise
 
         elif name == "find_by_name":
             pattern = args.get("pattern", "").strip()
@@ -2482,6 +2518,19 @@ SLASH_COMMANDS = {
     "/exit": "Save session and exit (or Ctrl+Q)"
 }
 
+def clamp_to_lines(text: str, max_lines: int = 5, expand_hint: str = "Ctrl+O to expand") -> Tuple[str, bool]:
+    """Clamps text to max_lines, returning (clamped_text, is_truncated)."""
+    if not text:
+        return "", False
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text, False
+    truncated = lines[:max_lines]
+    remaining = len(lines) - max_lines
+    hint = f"… [dim](+{remaining} more lines, {expand_hint})[/dim]"
+    truncated.append(hint)
+    return "\n".join(truncated), True
+
 class XDHCompleter(Completer):
     def __init__(self, harness: XDHarness):
         self.harness = harness
@@ -2631,6 +2680,7 @@ class XDHApp:
         self.staged_diffs: List[Dict[str, str]] = []
         self.drawer_open: bool = False
         self.active_schedules: List[Dict[str, Any]] = []
+        self._spinner_thread: Optional[threading.Thread] = None
 
         # Segment 1: Fixed Top Banner Window
         self.top_banner_window = Window(
@@ -2962,7 +3012,7 @@ class XDHApp:
                     self.viewport_window,
                     Window(
                         content=self.drawer_control,
-                        width=lambda: Dimension(preferred=32, max=40) if self.drawer_open else Dimension(preferred=0, max=0),
+                        width=to_dimension(lambda: Dimension(preferred=32, max=40) if self.drawer_open else Dimension(preferred=0, max=0)),
                         dont_extend_width=True
                     )
                 ]),
@@ -3263,6 +3313,21 @@ class XDHApp:
             except Exception:
                 pass
 
+    def _start_spinner_ticker(self):
+        """Starts a background daemon thread that continuously ticks UI invalidation while busy."""
+        if self._spinner_thread and self._spinner_thread.is_alive():
+            return
+        def _ticker():
+            while self.is_busy:
+                self.invalidate_ui(force=True)
+                time.sleep(0.08)
+        self._spinner_thread = threading.Thread(target=_ticker, daemon=True)
+        self._spinner_thread.start()
+
+    def _stop_spinner_ticker(self):
+        """Ensures final UI invalidation after busy state ends."""
+        self.invalidate_ui(force=True)
+
     def smooth_scroll_by(self, delta: int, steps: int = 4, delay: float = 0.015):
         """Animates viewport scroll offset smoothly in small increments."""
         def _scroll_worker():
@@ -3312,8 +3377,9 @@ class XDHApp:
                     padding=(0, 1)
                 )
             else:
+                clamped_thought, _ = clamp_to_lines(thought_text, max_lines=5)
                 panel = Panel(
-                    Text(thought_text, style=f"dim {theme['warning']}"),
+                    Text.from_markup(clamped_thought) if "… [dim]" in clamped_thought else Text(clamped_thought, style=f"dim {theme['warning']}"),
                     title=f"⚡ Thinking{time_str}",
                     box=box.ROUNDED,
                     border_style=theme["warning"],
@@ -3337,13 +3403,16 @@ class XDHApp:
                 folded_msg = f"[dim italic]Output collapsed ({len(output_content)} chars). Press Ctrl+O to expand.[/dim italic]"
                 blocks.append(render_rich_to_string(Text.from_markup(folded_msg), max_cols=cols))
             elif output_content and output_content not in ["[Exited with 0]", "None"]:
+                # If not in full collapsed_state, limit tool output box to 5 lines
+                clamped_out, was_truncated = clamp_to_lines(output_content, max_lines=5)
+                
                 if name == "replace_file_content":
                     try:
-                        syn = Syntax(output_content[:4000], "diff", theme="monokai", line_numbers=True, word_wrap=True)
+                        syn = Syntax(clamped_out[:4000], "diff", theme="monokai", line_numbers=True, word_wrap=True)
                         out_panel = Panel(syn, title="📝 Unified Diff Hunk", box=box.ROUNDED, border_style=theme["accent"], padding=(0, 1))
                         blocks.append(render_rich_to_string(out_panel, max_cols=cols))
                     except Exception:
-                        out_panel = Panel(Text(output_content[:4000]), title="📝 Diff", box=box.ROUNDED, border_style=theme["accent"], padding=(0, 1))
+                        out_panel = Panel(Text.from_markup(clamped_out) if was_truncated else Text(clamped_out[:4000]), title="📝 Diff", box=box.ROUNDED, border_style=theme["accent"], padding=(0, 1))
                         blocks.append(render_rich_to_string(out_panel, max_cols=cols))
                 elif name in ["read_file", "write_file"]:
                     lang = "python"
@@ -3353,17 +3422,20 @@ class XDHApp:
                         elif p.endswith(".json"): lang = "json"
                         elif p.endswith((".js", ".ts")): lang = "javascript"
                     try:
-                        syn = Syntax(output_content[:4000], lang, theme="monokai", line_numbers=True, word_wrap=True)
+                        syn = Syntax(clamped_out[:4000], lang, theme="monokai", line_numbers=True, word_wrap=True)
                         out_panel = Panel(syn, title=f"⚡ Output: {name}", box=box.ROUNDED, border_style=theme["dim"], padding=(0, 1))
                         blocks.append(render_rich_to_string(out_panel, max_cols=cols))
                     except Exception:
-                        out_panel = Panel(Text(output_content[:4000], style=f"dim {theme['fg_bar']}"), title=f"⚡ Output: {name}", box=box.ROUNDED, border_style=theme["dim"], padding=(0, 1))
+                        out_panel = Panel(Text.from_markup(clamped_out) if was_truncated else Text(clamped_out[:4000], style=f"dim {theme['fg_bar']}"), title=f"⚡ Output: {name}", box=box.ROUNDED, border_style=theme["dim"], padding=(0, 1))
                         blocks.append(render_rich_to_string(out_panel, max_cols=cols))
                 elif name in ["list_dir", "grep_search", "file_info", "find_by_name"]:
-                    out_panel = Panel(Text(output_content[:4000], style=f"dim {theme['fg_bar']}"), title=f"⚡ Output: {name}", box=box.ROUNDED, border_style=theme["dim"], padding=(0, 1))
+                    out_panel = Panel(Text.from_markup(clamped_out) if was_truncated else Text(clamped_out[:4000], style=f"dim {theme['fg_bar']}"), title=f"⚡ Output: {name}", box=box.ROUNDED, border_style=theme["dim"], padding=(0, 1))
                     blocks.append(render_rich_to_string(out_panel, max_cols=cols))
                 elif name == "bash":
-                    out_panel = Panel(Text(output_content[:3000], style=f"dim {theme['fg_bar']}"), title="💻 Shell Output", box=box.ROUNDED, border_style=theme["dim"], padding=(0, 1))
+                    out_panel = Panel(Text.from_markup(clamped_out) if was_truncated else Text(clamped_out[:3000], style=f"dim {theme['fg_bar']}"), title="💻 Shell Output", box=box.ROUNDED, border_style=theme["dim"], padding=(0, 1))
+                    blocks.append(render_rich_to_string(out_panel, max_cols=cols))
+                else:
+                    out_panel = Panel(Text.from_markup(clamped_out) if was_truncated else Text(clamped_out[:4000], style=f"dim {theme['fg_bar']}"), title=f"⚡ Output: {name}", box=box.ROUNDED, border_style=theme["dim"], padding=(0, 1))
                     blocks.append(render_rich_to_string(out_panel, max_cols=cols))
             return "\n".join(blocks)
 
@@ -4080,7 +4152,8 @@ class XDHApp:
         self.abort_requested = False
         start_time = time.time()
         self.harness.status_label = "Thinking"
-        self.invalidate_ui()
+        self._start_spinner_ticker()
+        self.invalidate_ui(force=True)
         theme = self.harness.theme
 
         try:
@@ -4126,9 +4199,10 @@ class XDHApp:
                         if accumulated_thought and self.harness.config.get("show_thinking"):
                             thought_lines = accumulated_thought.splitlines()
                             total_thought_lines = len(thought_lines)
-                            if total_thought_lines > 50:
-                                preview_lines = thought_lines[-40:]
-                                preview_thought = f"… [dim](omitted first {total_thought_lines - 40} lines while streaming)[/dim]\n" + "\n".join(preview_lines)
+                            # Clamped to 5 lines during streaming as requested
+                            if total_thought_lines > 5:
+                                preview_lines = thought_lines[-5:]
+                                preview_thought = f"… [dim](omitted first {total_thought_lines - 5} lines while streaming)[/dim]\n" + "\n".join(preview_lines)
                                 title_extra = f" (line {total_thought_lines})"
                             else:
                                 preview_thought = accumulated_thought
@@ -4255,7 +4329,7 @@ class XDHApp:
             self.harness.status_label = "Ready"
             self.is_busy = False
             self.abort_requested = False
-            self.invalidate_ui()
+            self._stop_spinner_ticker()
 
     def harness_stream_call(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None):
         max_retries = 5
