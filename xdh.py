@@ -6,7 +6,7 @@ Features: 3-Segment Layout, Micro-Action Badges, Context Ghost-Suggest,
 Dynamic Expanding Composer, and Interactive Settings.
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 import os
 import sys
@@ -22,6 +22,8 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import base64
+import importlib
+import importlib.util
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -59,11 +61,13 @@ from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 BASE_DIR = Path.home() / ".xdharness"
 SESSIONS_DIR = BASE_DIR / "sessions"
 SKILLS_DIR = BASE_DIR / "skills"
+AGENTS_DIR = BASE_DIR / "agents"
+PLUGINS_DIR = BASE_DIR / "plugins"
 BACKUPS_DIR = BASE_DIR / "backups"
 CONFIG_FILE = BASE_DIR / "config.json"
 HISTORY_FILE = BASE_DIR / "prompt_history.txt"
 
-for p in [BASE_DIR, SESSIONS_DIR, SKILLS_DIR, BACKUPS_DIR]:
+for p in [BASE_DIR, SESSIONS_DIR, SKILLS_DIR, AGENTS_DIR, PLUGINS_DIR, BACKUPS_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------
@@ -673,6 +677,357 @@ class XDHarness:
         return new_sid
 
 # ---------------------------------------------------------
+# Skills System (Load, Create, Call)
+# ---------------------------------------------------------
+class SkillManager:
+    """Manages skill definitions stored in ~/.xdharness/skills/<name>/SKILL.md."""
+    def __init__(self, skills_dir: Path = SKILLS_DIR):
+        self.skills_dir = skills_dir
+        self.skills_dir.mkdir(parents=True, exist_ok=True)
+        self.ensure_default_skills()
+
+    def ensure_default_skills(self):
+        """Seed built-in skills if not already present."""
+        create_skill_path = self.skills_dir / "create_skill" / "SKILL.md"
+        if not create_skill_path.exists():
+            create_skill_path.parent.mkdir(parents=True, exist_ok=True)
+            create_skill_path.write_text("""---
+name: create_skill
+description: Interactive and programmatic skill creation engine. Generates reusable skills with metadata, instructions, and schemas.
+parameters:
+  name: The unique slug name of the new skill (lowercase, hyphens/underscores).
+  description: Short one-line summary of what the skill does.
+  instructions: Comprehensive prompt instructions, rules, and best practices for the skill.
+---
+# Create Skill
+This skill guides the agent in drafting and registering custom reusable skills into `~/.xdharness/skills/`.
+When creating a skill:
+1. Define a clear, descriptive name (e.g. `code-reviewer`, `git-release`).
+2. Write concise YAML frontmatter with `name`, `description`, and `parameters`.
+3. Provide step-by-step instructions under Markdown headings.
+4. Save the skill as `~/.xdharness/skills/<name>/SKILL.md`.
+""", encoding="utf-8")
+
+        create_agent_path = self.skills_dir / "create_agent" / "SKILL.md"
+        if not create_agent_path.exists():
+            create_agent_path.parent.mkdir(parents=True, exist_ok=True)
+            create_agent_path.write_text("""---
+name: create_agent
+description: Specialized subagent generator defining autonomous agent personas, system prompts, default model/provider overrides, and tool suites.
+parameters:
+  name: Unique name identifier of the agent persona (e.g. 'tester', 'auditor', 'architect').
+  role: Human-readable role description (e.g. 'Security Vulnerability Auditor').
+  system_prompt: Detailed system instructions specifying behaviors, constraints, and operational goals.
+  model: Optional model override (e.g. 'gpt-4o-mini', 'claude-3.5-sonnet').
+  provider: Optional provider override (e.g. 'openrouter', 'groq', 'ollama').
+  tools: List of enabled tool names for this agent.
+---
+# Create Agent
+This skill configures specialized agent personas into `~/.xdharness/agents/<name>.json`.
+Specialized subagents can run concurrently in parallel threads to solve complex multi-phase development tasks.
+""", encoding="utf-8")
+
+    def parse_skill_file(self, skill_path: Path) -> Optional[Dict[str, Any]]:
+        """Parses a SKILL.md file extracting frontmatter and body."""
+        try:
+            content = skill_path.read_text(encoding="utf-8", errors="replace")
+            meta = {"name": skill_path.parent.name, "description": "", "instructions": ""}
+            if content.startswith("---"):
+                parts = content.split("---", 2)
+                if len(parts) >= 3:
+                    frontmatter = parts[1].strip()
+                    meta["instructions"] = parts[2].strip()
+                    for line in frontmatter.splitlines():
+                        # Only parse top-level keys (no leading indentation)
+                        if ":" in line and not line.startswith((" ", "\t")):
+                            k, v = line.split(":", 1)
+                            meta[k.strip()] = v.strip()
+                else:
+                    meta["instructions"] = content
+            else:
+                meta["instructions"] = content
+            return meta
+        except Exception:
+            return None
+
+    def list_skills(self) -> List[Dict[str, Any]]:
+        """Discovers all skills in SKILLS_DIR."""
+        skills = []
+        for p in sorted(self.skills_dir.glob("*/SKILL.md")):
+            info = self.parse_skill_file(p)
+            if info:
+                skills.append(info)
+        return skills
+
+    def get_skill(self, name: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a skill by name."""
+        clean_name = name.strip().lower().replace(" ", "_")
+        target_file = self.skills_dir / clean_name / "SKILL.md"
+        if target_file.is_file():
+            return self.parse_skill_file(target_file)
+        # Fallback search by folder or name attribute
+        for skill in self.list_skills():
+            if skill.get("name", "").lower() == clean_name or skill.get("name", "").lower() == name.lower():
+                return skill
+        return None
+
+    def create_skill(self, name: str, description: str, instructions: str, parameters: str = "") -> Tuple[bool, str]:
+        """Creates or updates a skill in ~/.xdharness/skills/<name>/SKILL.md."""
+        clean_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.strip().lower())
+        if not clean_name:
+            return False, "Error: Invalid skill name."
+        folder = self.skills_dir / clean_name
+        folder.mkdir(parents=True, exist_ok=True)
+        file_path = folder / "SKILL.md"
+        content = f"""---
+name: {clean_name}
+description: {description.strip()}
+parameters: {parameters.strip() or 'None'}
+---
+{instructions.strip()}
+"""
+        file_path.write_text(content, encoding="utf-8")
+        return True, f"Skill '{clean_name}' created at {file_path}"
+
+SKILL_MGR = SkillManager()
+
+# ---------------------------------------------------------
+# Multi-Agent Subagent System (Definition & Parallel Orchestration)
+# ---------------------------------------------------------
+class AgentManager:
+    """Manages custom agent personas in ~/.xdharness/agents/ and parallel subagent execution."""
+    def __init__(self, agents_dir: Path = AGENTS_DIR):
+        self.agents_dir = agents_dir
+        self.agents_dir.mkdir(parents=True, exist_ok=True)
+        self.ensure_default_agents()
+
+    def ensure_default_agents(self):
+        """Seed default agent personas."""
+        defaults = {
+            "researcher": {
+                "name": "researcher",
+                "role": "Codebase & Web Researcher",
+                "system_prompt": "You are a specialized research agent. Survey codebases, documentation, and external resources thoroughly. Report detailed findings.",
+                "tools": ["read_file", "list_dir", "grep_search", "find_by_name", "file_info", "search_web", "fetch_url"]
+            },
+            "coder": {
+                "name": "coder",
+                "role": "Feature Implementer & Refactoring Engineer",
+                "system_prompt": "You are a specialized software engineer. Write clean, bug-free code, perform file modifications, and verify syntax integrity.",
+                "tools": ["read_file", "write_file", "replace_file_content", "list_dir", "bash", "git_status", "git_diff"]
+            },
+            "tester": {
+                "name": "tester",
+                "role": "QA & Test Execution Specialist",
+                "system_prompt": "You are a QA automation and testing agent. Run tests, detect regressions, verify error states, and formulate patch recommendations.",
+                "tools": ["bash", "read_file", "write_file", "bg_command"]
+            },
+            "reviewer": {
+                "name": "reviewer",
+                "role": "Code Quality & Security Reviewer",
+                "system_prompt": "You are an expert security and code auditor. Inspect diffs, identify security risks, adherence to coding standards, and recommend fixes.",
+                "tools": ["read_file", "grep_search", "git_diff"]
+            }
+        }
+        for name, spec in defaults.items():
+            f = self.agents_dir / f"{name}.json"
+            if not f.exists():
+                f.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+
+    def list_agents(self) -> List[Dict[str, Any]]:
+        agents = []
+        for f in sorted(self.agents_dir.glob("*.json")):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                agents.append(data)
+            except Exception:
+                pass
+        return agents
+
+    def get_agent(self, name: str) -> Optional[Dict[str, Any]]:
+        f = self.agents_dir / f"{name.strip().lower()}.json"
+        if f.is_file():
+            try:
+                return json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        for a in self.list_agents():
+            if a.get("name", "").lower() == name.strip().lower():
+                return a
+        return None
+
+    def create_agent(self, name: str, role: str, system_prompt: str, model: str = "", provider: str = "", tools: Optional[List[str]] = None) -> Tuple[bool, str]:
+        clean_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.strip().lower())
+        if not clean_name:
+            return False, "Error: Invalid agent name."
+        spec = {
+            "name": clean_name,
+            "role": role.strip(),
+            "system_prompt": system_prompt.strip(),
+            "model": model.strip() if model else "",
+            "provider": provider.strip() if provider else "",
+            "tools": tools if tools is not None else ["read_file", "write_file", "list_dir", "bash"]
+        }
+        f = self.agents_dir / f"{clean_name}.json"
+        f.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+        return True, f"Agent '{clean_name}' created at {f}"
+
+    def delete_agent(self, name: str) -> bool:
+        f = self.agents_dir / f"{name.strip().lower()}.json"
+        if f.is_file():
+            f.unlink()
+            return True
+        return False
+
+AGENT_MGR = AgentManager()
+
+# ---------------------------------------------------------
+# Dynamic Plugin Management System (User & Community Plugins)
+# ---------------------------------------------------------
+class PluginManager:
+    """Discovers, loads, installs, and manages extensions in ~/.xdharness/plugins/."""
+    def __init__(self, plugins_dir: Path = PLUGINS_DIR):
+        self.plugins_dir = plugins_dir
+        self.plugins_dir.mkdir(parents=True, exist_ok=True)
+        self.loaded_plugins: Dict[str, Any] = {}
+        self.plugin_tools: Dict[str, Tuple[Dict[str, Any], Any]] = {}
+        self.ensure_default_plugins()
+        self.load_all_plugins()
+
+    def ensure_default_plugins(self):
+        """Seed an example custom plugin."""
+        example_plugin = self.plugins_dir / "system_info.py"
+        if not example_plugin.exists():
+            example_plugin.write_text('''"""
+Example Plugin: system_info
+Exports a custom tool to inspect platform environment.
+"""
+
+def get_sys_environment():
+    import os, platform
+    return {
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "arch": platform.machine(),
+        "cwd": os.getcwd()
+    }
+
+TOOLS = [
+    {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "plugin_system_environment",
+                "description": "Inspect OS and Python environment details via plugin.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        },
+        "handler": lambda args, harness: (str(get_sys_environment()), "🔌 Plugin › System Info")
+    }
+]
+''', encoding="utf-8")
+
+    def load_plugin_file(self, file_path: Path) -> bool:
+        try:
+            module_name = f"xdh_plugin_{file_path.stem}"
+            spec = importlib.util.spec_from_file_location(module_name, str(file_path))
+            if not spec or not spec.loader:
+                return False
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self.loaded_plugins[file_path.stem] = mod
+
+            # Register tools exported by plugin
+            if hasattr(mod, "TOOLS"):
+                for tool_entry in mod.TOOLS:
+                    tspec = tool_entry.get("spec")
+                    thandler = tool_entry.get("handler")
+                    if tspec and thandler:
+                        fname = tspec.get("function", {}).get("name")
+                        if fname:
+                            self.plugin_tools[fname] = (tspec, thandler)
+            return True
+        except Exception:
+            return False
+
+    def load_all_plugins(self):
+        """Loads all .py plugins from plugins_dir."""
+        for p in sorted(self.plugins_dir.glob("*.py")):
+            self.load_plugin_file(p)
+        # Also check subdirectories with plugin.py
+        for sub in sorted(self.plugins_dir.iterdir()):
+            if sub.is_dir() and (sub / "plugin.py").is_file():
+                self.load_plugin_file(sub / "plugin.py")
+
+    def list_plugins(self) -> List[Dict[str, Any]]:
+        results = []
+        for p in sorted(self.plugins_dir.iterdir()):
+            if p.is_file() and p.suffix == ".py":
+                results.append({
+                    "name": p.stem,
+                    "type": "single-file",
+                    "path": str(p),
+                    "loaded": p.stem in self.loaded_plugins
+                })
+            elif p.is_dir() and (p / "plugin.py").is_file():
+                results.append({
+                    "name": p.name,
+                    "type": "directory/git",
+                    "path": str(p),
+                    "loaded": (p / "plugin.py").stem in self.loaded_plugins
+                })
+        return results
+
+    def install_plugin_from_git(self, git_url: str, name: Optional[str] = None) -> Tuple[bool, str]:
+        """Clones a community plugin from a Git repository into ~/.xdharness/plugins/."""
+        try:
+            if not name:
+                name = git_url.rstrip("/").split("/")[-1]
+                if name.endswith(".git"):
+                    name = name[:-4]
+            target_dir = self.plugins_dir / name
+            if target_dir.exists():
+                return False, f"Plugin '{name}' already exists in {target_dir}."
+            res = subprocess.run(["git", "clone", "--depth", "1", git_url, str(target_dir)], capture_output=True, text=True, timeout=60)
+            if res.returncode != 0:
+                return False, f"Git clone failed: {res.stderr.strip()}"
+            # Attempt to load plugin
+            if (target_dir / "plugin.py").is_file():
+                self.load_plugin_file(target_dir / "plugin.py")
+            elif (target_dir / f"{name}.py").is_file():
+                self.load_plugin_file(target_dir / f"{name}.py")
+            return True, f"Successfully installed plugin '{name}' from {git_url}."
+        except Exception as e:
+            return False, f"Install failed: {str(e)}"
+
+    def add_plugin(self, name: str, code: str) -> Tuple[bool, str]:
+        """Creates a new Python plugin directly."""
+        clean_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.strip())
+        target = self.plugins_dir / f"{clean_name}.py"
+        target.write_text(code, encoding="utf-8")
+        ok = self.load_plugin_file(target)
+        return ok, f"Plugin '{clean_name}' saved and {'loaded' if ok else 'failed to load'} at {target}"
+
+    def delete_plugin(self, name: str) -> Tuple[bool, str]:
+        """Deletes a plugin by name."""
+        single = self.plugins_dir / f"{name}.py"
+        if single.is_file():
+            single.unlink()
+            self.loaded_plugins.pop(name, None)
+            return True, f"Plugin '{name}' deleted."
+        multi = self.plugins_dir / name
+        if multi.is_dir():
+            shutil.rmtree(multi)
+            self.loaded_plugins.pop(name, None)
+            return True, f"Plugin directory '{name}' deleted."
+        return False, f"Plugin '{name}' not found."
+
+PLUGIN_MGR = PluginManager()
+
+# ---------------------------------------------------------
 # Built-In Tools & Action Formatters
 # ---------------------------------------------------------
 TOOLS_SPEC = [
@@ -885,8 +1240,131 @@ TOOLS_SPEC = [
                 "required": ["command"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_skill",
+            "description": "Create and register a new reusable skill with metadata and instructions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Unique identifier slug for the skill"},
+                    "description": {"type": "string", "description": "Short explanation of what the skill accomplishes"},
+                    "instructions": {"type": "string", "description": "Detailed instructions and operational procedures for executing the skill"},
+                    "parameters": {"type": "string", "description": "Optional parameters description"}
+                },
+                "required": ["name", "description", "instructions"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "call_skill",
+            "description": "Invoke and execute an existing registered skill by name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name of the skill to execute"},
+                    "input_data": {"type": "string", "description": "Context or input arguments to pass into the skill"}
+                },
+                "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_agent",
+            "description": "Define and register a new specialized agent persona with custom system prompt and tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Unique name of the agent"},
+                    "role": {"type": "string", "description": "Human-readable role description"},
+                    "system_prompt": {"type": "string", "description": "Instructions and behavior constraints for this agent"},
+                    "model": {"type": "string", "description": "Optional model override (e.g. gpt-4o-mini)"},
+                    "provider": {"type": "string", "description": "Optional provider override"},
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of tool names allowed for this agent"
+                    }
+                },
+                "required": ["name", "role", "system_prompt"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_agents",
+            "description": "Spawn multiple specialized subagents concurrently in parallel threads to work on subtasks together.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subtasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "agent": {"type": "string", "description": "Name of the registered agent persona (e.g. researcher, coder, tester, reviewer)"},
+                                "task": {"type": "string", "description": "Specific task prompt for this subagent"}
+                            },
+                            "required": ["agent", "task"]
+                        },
+                        "description": "List of subtasks and their designated agent personas"
+                    }
+                },
+                "required": ["subtasks"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_plugins",
+            "description": "Manage plugins (list, add, install from git, delete).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "add", "install", "delete"], "description": "Action to perform"},
+                    "name": {"type": "string", "description": "Plugin name"},
+                    "source": {"type": "string", "description": "Git repository URL (for install) or Python code (for add)"}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_question",
+            "description": "Pause autonomous execution and ask the user a clarifying question with selectable or direct options.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question to ask the user"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of predefined choices/options for the user"
+                    }
+                },
+                "required": ["question"]
+            }
+        }
     }
 ]
+
+def get_all_tools_spec() -> List[Dict[str, Any]]:
+    """Returns built-in tools plus dynamically registered plugin tools."""
+    combined = list(TOOLS_SPEC)
+    for fname, (tspec, _) in PLUGIN_MGR.plugin_tools.items():
+        if not any(t.get("function", {}).get("name") == fname for t in combined):
+            combined.append(tspec)
+    return combined
 
 def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[str, str]:
     """Executes a tool and returns (detailed_output, micro_action_badge)."""
@@ -1182,6 +1660,249 @@ def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[s
             task_id = BG_TASKS.start_task(cmd)
             return f"Started background task [{task_id}]: `{cmd}`\nUse '/tasks list' or '/tasks logs {task_id}' to monitor.", f"⚡ Task  › [bold green]{task_id}[/bold green] (running)"
 
+        elif name == "create_skill":
+            sname = args.get("name", "").strip()
+            sdesc = args.get("description", "").strip()
+            sinst = args.get("instructions", "").strip()
+            sparams = args.get("parameters", "").strip()
+            if not sname or not sdesc or not sinst:
+                return "Error: Missing required fields ('name', 'description', 'instructions').", "🎯 Skill › [red]Missing Info[/red]"
+            ok, msg = SKILL_MGR.create_skill(sname, sdesc, sinst, sparams)
+            return msg, f"🎯 Skill › [bold green]+{sname}[/bold green]"
+
+        elif name == "call_skill":
+            sname = args.get("name", "").strip()
+            input_data = args.get("input_data", "").strip()
+            skill_info = SKILL_MGR.get_skill(sname)
+            if not skill_info:
+                avail = ", ".join([s.get("name", "") for s in SKILL_MGR.list_skills()])
+                return f"Error: Skill '{sname}' not found. Available skills: {avail}", f"🎯 Skill › [red]{sname} Not Found[/red]"
+            instructions = skill_info.get("instructions", "")
+            desc = skill_info.get("description", "")
+            res_str = f"## Skill Invocation: {sname}\n**Description**: {desc}\n\n**Instructions**:\n{instructions}"
+            if input_data:
+                res_str += f"\n\n**User / Context Input**:\n{input_data}"
+            return res_str, f"🎯 Skill › [bold cyan]{sname}[/bold cyan] (executed)"
+
+        elif name == "create_agent":
+            aname = args.get("name", "").strip()
+            arole = args.get("role", "").strip()
+            aprompt = args.get("system_prompt", "").strip()
+            amodel = args.get("model", "").strip()
+            aprov = args.get("provider", "").strip()
+            atools = args.get("tools")
+            if not aname or not arole or not aprompt:
+                return "Error: Missing required fields ('name', 'role', 'system_prompt').", "🤖 Agent › [red]Missing Info[/red]"
+            ok, msg = AGENT_MGR.create_agent(aname, arole, aprompt, amodel, aprov, atools)
+            return msg, f"🤖 Agent › [bold green]+{aname}[/bold green]"
+
+        elif name == "spawn_agents":
+            subtasks = args.get("subtasks", [])
+            if not subtasks or not isinstance(subtasks, list):
+                return "Error: 'subtasks' must be a non-empty list of subagent tasks.", "🤖 Agents › [red]Empty[/red]"
+
+            results = []
+            threads = []
+            results_lock = threading.Lock()
+
+            active_app = getattr(harness, "app_instance", None)
+            if active_app:
+                active_app.append_output(f"🚀 [bold cyan]Multi-Agent Orchestration[/bold cyan]: Spawning {len(subtasks)} subagents in parallel...")
+
+            def _run_subagent_task(agent_name: str, task_text: str, idx: int):
+                agent_spec = AGENT_MGR.get_agent(agent_name) or {
+                    "name": agent_name,
+                    "role": f"Subagent {agent_name}",
+                    "system_prompt": f"You are a specialized subagent tasked with: {task_text}",
+                    "tools": ["read_file", "write_file", "list_dir", "bash"]
+                }
+                role = agent_spec.get("role", agent_name)
+
+                # Custom subagent provider / model override if configured
+                pdata = dict(harness.current_provider_data)
+                if agent_spec.get("provider"):
+                    cand = harness.config.get("providers", {}).get(agent_spec["provider"])
+                    if cand: pdata = cand
+                if agent_spec.get("model"):
+                    pdata["default_model"] = agent_spec["model"]
+
+                base_url = pdata.get("base_url", "").rstrip("/")
+                api_key = pdata.get("api_key") or "none"
+                model = pdata.get("default_model", "unknown")
+
+                sys_prompt = f"Role: {role}\nInstructions: {agent_spec.get('system_prompt', '')}\nFocus on executing your assigned task efficiently."
+                sub_msgs = [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": task_text}
+                ]
+
+                # Filter allowed tools for this subagent
+                allowed_tool_names = set(agent_spec.get("tools") or ["read_file", "write_file", "list_dir", "bash"])
+                sub_tools = [t for t in get_all_tools_spec() if t.get("function", {}).get("name") in allowed_tool_names]
+
+                agent_out = ""
+                try:
+                    # Run multi-turn autonomous tool loop for subagent
+                    for sub_turn in range(5):
+                        req_body = {
+                            "model": model,
+                            "messages": sub_msgs,
+                            "tools": sub_tools if sub_tools else None
+                        }
+                        req_data = json.dumps(req_body).encode("utf-8")
+                        headers = {"Content-Type": "application/json"}
+                        if api_key and api_key != "none":
+                            headers["Authorization"] = f"Bearer {api_key}"
+                        req = urllib.request.Request(f"{base_url}/chat/completions", data=req_data, headers=headers, method="POST")
+
+                        with urllib.request.urlopen(req, timeout=90) as resp:
+                            res_json = json.loads(resp.read().decode("utf-8"))
+                            choice = res_json.get("choices", [{}])[0]
+                            msg = choice.get("message", {})
+                            content = msg.get("content", "") or ""
+                            tool_calls = msg.get("tool_calls", [])
+
+                            if content:
+                                agent_out += "\n" + content
+
+                            sub_msgs.append(msg)
+
+                            if not tool_calls:
+                                break
+
+                            for tc in tool_calls:
+                                fn = tc.get("function", {})
+                                fname = fn.get("name")
+                                try:
+                                    fargs = json.loads(fn.get("arguments", "{}"))
+                                except Exception:
+                                    fargs = {}
+                                tout, _ = execute_tool(fname, fargs, harness)
+                                sub_msgs.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc.get("id", f"sub_call_{sub_turn}"),
+                                    "name": fname,
+                                    "content": str(tout)
+                                })
+                except Exception as sub_err:
+                    agent_out += f"\n[Subagent execution error: {str(sub_err)}]"
+
+                summary_clean = agent_out.strip() if agent_out.strip() else "[No textual response produced]"
+                with results_lock:
+                    results.append({
+                        "index": idx,
+                        "agent": agent_name,
+                        "role": role,
+                        "task": task_text,
+                        "output": summary_clean
+                    })
+                if active_app:
+                    active_app.append_output(f"✓ [bold green]Subagent Completed[/bold green] › [cyan]{agent_name}[/cyan] ({role})")
+
+            for i, st in enumerate(subtasks):
+                an = st.get("agent", "coder")
+                tk = st.get("task", "")
+                t = threading.Thread(target=_run_subagent_task, args=(an, tk, i), daemon=True)
+                threads.append(t)
+                t.start()
+
+            for t in threads:
+                t.join(timeout=180)
+
+            # Sort results by original subtask index
+            results.sort(key=lambda x: x["index"])
+            out_blocks = []
+            for r in results:
+                out_blocks.append(f"### Subagent `{r['agent']}` ({r['role']})\n**Assigned Task**: {r['task']}\n\n**Findings & Result**:\n{r['output']}\n")
+
+            full_report = "\n---\n".join(out_blocks)
+            badge = f"🤖 Multi-Agent › [bold green]{len(results)}/{len(subtasks)} Subagents Completed[/bold green]"
+            return full_report, badge
+
+        elif name == "manage_plugins":
+            action = args.get("action", "list").lower()
+            pname = args.get("name", "").strip()
+            source = args.get("source", "").strip()
+
+            if action == "list":
+                plugins = PLUGIN_MGR.list_plugins()
+                if not plugins:
+                    return "No plugins currently installed.", "🔌 Plugin › [Empty]"
+                p_lines = [f"- **{p['name']}** ({p['type']}) [Loaded: {p['loaded']}] at `{p['path']}`" for p in plugins]
+                return "Installed Plugins:\n" + "\n".join(p_lines), f"🔌 Plugin › [bold cyan]{len(plugins)} Plugins[/bold cyan]"
+
+            elif action == "install":
+                if not source:
+                    return "Error: 'source' Git repository URL is required for installation.", "🔌 Plugin › [red]Missing URL[/red]"
+                ok, msg = PLUGIN_MGR.install_plugin_from_git(source, pname or None)
+                badge = f"🔌 Plugin › [{'bold green' if ok else 'red'}]{'Installed' if ok else 'Failed'}[/]"
+                return msg, badge
+
+            elif action == "add":
+                if not pname or not source:
+                    return "Error: Both 'name' and 'source' (Python code) are required to add a plugin.", "🔌 Plugin › [red]Missing Info[/red]"
+                ok, msg = PLUGIN_MGR.add_plugin(pname, source)
+                return msg, f"🔌 Plugin › [{'bold green' if ok else 'red'}]+{pname}[/]"
+
+            elif action == "delete":
+                if not pname:
+                    return "Error: Plugin 'name' is required to delete.", "🔌 Plugin › [red]Missing Name[/red]"
+                ok, msg = PLUGIN_MGR.delete_plugin(pname)
+                return msg, f"🔌 Plugin › [{'bold green' if ok else 'red'}]-{pname}[/]"
+
+            return f"Error: Unknown action '{action}'.", "🔌 Plugin › [red]Unknown Action[/red]"
+
+        elif name == "ask_question":
+            question = args.get("question", "").strip()
+            options = args.get("options") or []
+            if not question:
+                return "Error: Empty question.", "❓ Question › [Empty]"
+
+            active_app = getattr(harness, "app_instance", None)
+            if not active_app:
+                return "Error: TUI not attached, cannot prompt user.", "❓ Question › [Error]"
+
+            # Set interactive question mode on the active TUI
+            active_app.active_question = {
+                "question": question,
+                "options": options,
+                "answer_event": threading.Event(),
+                "answer_value": ""
+            }
+
+            # Prompt user in viewport
+            q_lines = [f"❓ [bold yellow]Agent asks:[/bold yellow] {question}"]
+            if options:
+                q_lines.append("[dim]Options:[/dim]")
+                for idx, opt in enumerate(options, 1):
+                    q_lines.append(f"  [bold cyan]({idx})[/bold cyan] {opt}")
+                q_lines.append("[italic dim]Type your response or option number below and press Enter.[/italic dim]")
+
+            active_app.append_output("\n".join(q_lines))
+            active_app.invalidate_ui()
+
+            # Wait for user reply in composer
+            active_app.active_question["answer_event"].wait(timeout=300)
+            user_reply = active_app.active_question["answer_value"].strip()
+            active_app.active_question = None
+            active_app.invalidate_ui()
+
+            if not user_reply:
+                user_reply = "[No response received / Timed out after 5 minutes]"
+
+            return f"User answered: {user_reply}", f"❓ Question › [bold green]Answered[/bold green]"
+
+        # Check dynamic plugin tools
+        if name in PLUGIN_MGR.plugin_tools:
+            _, handler = PLUGIN_MGR.plugin_tools[name]
+            try:
+                res = handler(args, harness)
+                if isinstance(res, tuple):
+                    return str(res[0]), str(res[1])
+                return str(res), f"🔌 Plugin › {name}"
+            except Exception as pe:
+                return f"Plugin tool error: {str(pe)}", f"🔌 Plugin › [red]Error {name}[/red]"
+
         return f"Unknown tool: {name}", f"⚙ Tool  › {name}"
     except Exception as e:
         return f"Tool Error: {str(e)}", f"⚠️ Error › {name} ({str(e)})"
@@ -1214,6 +1935,9 @@ SLASH_COMMANDS = {
     "/scratch": "View or update scratchpad memo (/scratch view|set <text>|clear)",
     "/tree": "Display repository directory tree structure",
     "/export": "Export session transcript (/export md|json|html)",
+    "/skill": "Manage & execute skills (/skill list, run <name>, create)",
+    "/agent": "Manage & spawn agents (/agent list, spawn, create)",
+    "/plugin": "Manage plugins (/plugin list, add, install <url>, del <name>)",
     "/clear": "Clear conversation viewport (or Ctrl+L)",
     "/help": "Show available slash commands",
     "/exit": "Save session and exit (or Ctrl+Q)"
@@ -1278,6 +2002,21 @@ class XDHCompleter(Completer):
                 for opt in ["stats", "list", "load"]:
                     if opt.startswith(typed):
                         yield Completion(opt, start_position=-len(typed))
+            elif cmd == "/skill":
+                typed = parts[1] if len(parts) > 1 else ""
+                for opt in ["list", "run", "create"]:
+                    if opt.startswith(typed):
+                        yield Completion(opt, start_position=-len(typed))
+            elif cmd == "/agent":
+                typed = parts[1] if len(parts) > 1 else ""
+                for opt in ["list", "spawn", "create"]:
+                    if opt.startswith(typed):
+                        yield Completion(opt, start_position=-len(typed))
+            elif cmd == "/plugin":
+                typed = parts[1] if len(parts) > 1 else ""
+                for opt in ["list", "add", "install", "del"]:
+                    if opt.startswith(typed):
+                        yield Completion(opt, start_position=-len(typed))
             elif cmd == "/export":
                 typed = parts[1] if len(parts) > 1 else ""
                 for opt in ["md", "json", "html"]:
@@ -1319,11 +2058,14 @@ class XDHCompleter(Completer):
 class XDHApp:
     def __init__(self, harness: XDHarness):
         self.harness = harness
+        self.harness.app_instance = self
         self.completer = XDHCompleter(harness)
         self.auto_suggester = DynamicContextAutoSuggest(harness)
         self.lock = threading.Lock()
         self.is_busy = False
         self.abort_requested = False
+        self.active_question: Optional[Dict[str, Any]] = None
+        self.interrupted_task_context: Optional[str] = None
         self.spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self.spinner_index = 0
         self.buffer_text = ""
@@ -1376,8 +2118,15 @@ class XDHApp:
             wrap_lines=True
         )
 
+        def get_prompt_tag():
+            if self.active_question:
+                return [("class:prompt-question", "❓ Question ❯ ")]
+            if self.is_busy:
+                return [("class:prompt-busy", "⚡ [busy] ❯ ")]
+            return [("class:prompt", "xdh ❯ ")]
+
         prompt_tag_window = Window(
-            content=FormattedTextControl(lambda: [("class:prompt", "xdh ❯ ")]),
+            content=FormattedTextControl(get_prompt_tag),
             dont_extend_width=True,
             dont_extend_height=True
         )
@@ -1404,12 +2153,16 @@ class XDHApp:
         # Keybindings
         self.kb = KeyBindings()
 
+        @self.kb.add("escape")
         @self.kb.add("c-c")
         def _handle_interrupt_or_exit(event):
             if self.is_busy:
                 self.abort_requested = True
-                self.append_output("[yellow]⚡ Interrupt signal sent... aborting generation.[/yellow]")
+                self.append_output("[yellow]⚡ Interrupt signal sent (ESC/Ctrl+C)... stopping ongoing task.[/yellow]")
             else:
+                if event.key_sequence[0].key == "escape":
+                    # Single ESC when idle does not exit
+                    return
                 self.harness.save_session()
                 event.app.exit()
 
@@ -1511,15 +2264,59 @@ class XDHApp:
             if not text:
                 return
 
+            # Case 1: Answering an interactive ask_question prompt
+            if self.active_question:
+                self.input_buffer.text = ""
+                q_dict = self.active_question
+                # If numeric choice, resolve option label
+                chosen_text = text
+                if text.isdigit():
+                    opt_idx = int(text) - 1
+                    opts = q_dict.get("options", [])
+                    if 0 <= opt_idx < len(opts):
+                        chosen_text = opts[opt_idx]
+
+                self.append_history_block({
+                    "type": "user",
+                    "text": f"❯ {chosen_text}",
+                    "timestamp": time.strftime("%H:%M:%S")
+                })
+                q_dict["answer_value"] = chosen_text
+                q_dict["answer_event"].set()
+                self.invalidate_ui()
+                return
+
+            # Case 2: Slash command (executed immediately)
+            if text.startswith("/"):
+                self.input_buffer.text = ""
+                self.execute_slash_command(text)
+                return
+
+            # Case 3: User sends input while agent is busy running a task
             if self.is_busy:
-                self.append_output("⚠️ Agent is still processing, please wait...")
+                self.input_buffer.text = ""
+                self.abort_requested = True
+                self.append_history_block({
+                    "type": "user",
+                    "text": text,
+                    "timestamp": time.strftime("%H:%M:%S")
+                })
+                self.append_output("⚡ [bold yellow]Interrupted ongoing task for user update.[/bold yellow] Adapting context with your new instructions...")
+
+                def _interrupt_and_pivot():
+                    # Wait briefly for current step to halt
+                    time.sleep(0.3)
+                    updated_instruction = (
+                        f"[USER INTERRUPT / REVISED INSTRUCTION]: The user intervened while the previous task was running.\n"
+                        f"New update from user: \"{text}\"\n"
+                        f"Please adapt immediately: stop previous conflicting actions, adopt these instructions, and continue."
+                    )
+                    self.run_agent_thread(updated_instruction)
+
+                threading.Thread(target=_interrupt_and_pivot, daemon=True).start()
                 return
 
             self.input_buffer.text = ""
-
-            if text.startswith("/"):
-                self.execute_slash_command(text)
-                return
 
             if text.startswith("!"):
                 shell_cmd = text[1:].strip()
@@ -1637,6 +2434,8 @@ class XDHApp:
             "accent": f"bold {theme['accent']}",
             "dim": f"{theme['dim']}",
             "prompt": f"bold {theme['accent']}",
+            "prompt-question": f"bold {theme['warning']}",
+            "prompt-busy": f"bold {theme['secondary']}",
             "completion-menu": f"bg:{theme['bg_bar']} fg:{theme['fg_bar']}",
             "completion-menu.completion": f"bg:{theme['bg_bar']} fg:{theme['fg_bar']}",
             "completion-menu.completion.current": f"bg:{theme['primary']} fg:#000000 bold",
@@ -2437,6 +3236,73 @@ class XDHApp:
                 self.harness.save_session()
                 self.append_output("✓ Cleared scratchpad.")
 
+        elif root == "/skill":
+            sub = parts[1].lower() if len(parts) > 1 else "list"
+            if sub == "list":
+                skills = SKILL_MGR.list_skills()
+                if not skills:
+                    self.append_output("[dim italic]No skills registered.[/dim italic]")
+                else:
+                    table = Table(title="🎯 Registered Skills", box=box.ROUNDED, border_style=theme["rich_border"])
+                    table.add_column("Skill Name", style=f"bold {theme['primary']}")
+                    table.add_column("Description")
+                    for s in skills:
+                        table.add_row(s.get("name", ""), s.get("description", ""))
+                    self.append_output(render_rich_to_string(table, max_cols=cols))
+            elif sub == "run" and len(parts) >= 3:
+                sname = parts[2]
+                sinput = " ".join(parts[3:]) if len(parts) > 3 else ""
+                out, badge = execute_tool("call_skill", {"name": sname, "input_data": sinput}, self.harness)
+                sp = Panel(Markdown(out), title=f"🎯 Skill Execution: {sname}", box=box.ROUNDED, border_style=theme["accent"])
+                self.append_output(render_rich_to_string(sp, max_cols=cols))
+            elif sub == "create":
+                self.append_output("💡 [bold cyan]Create Skill[/bold cyan]: Ask the agent directly, e.g. `create a skill named 'deploy' to push and release` or use `/skill create <name> <description>`")
+            else:
+                self.append_output("[yellow]Usage: /skill <list|run <name> [input]|create>[/yellow]")
+
+        elif root == "/agent":
+            sub = parts[1].lower() if len(parts) > 1 else "list"
+            if sub == "list":
+                agents = AGENT_MGR.list_agents()
+                if not agents:
+                    self.append_output("[dim italic]No agents registered.[/dim italic]")
+                else:
+                    table = Table(title="🤖 Specialized Agents", box=box.ROUNDED, border_style=theme["rich_border"])
+                    table.add_column("Agent", style=f"bold {theme['primary']}")
+                    table.add_column("Role", style=f"bold {theme['warning']}")
+                    table.add_column("Tools", style=f"dim {theme['accent']}")
+                    table.add_column("Model Override")
+                    for a in agents:
+                        t_str = ", ".join(a.get("tools", []))[:30]
+                        table.add_row(a.get("name", ""), a.get("role", ""), t_str, a.get("model") or "default")
+                    self.append_output(render_rich_to_string(table, max_cols=cols))
+            elif sub == "spawn" and len(parts) >= 3:
+                task_prompt = " ".join(parts[2:])
+                self.run_agent_thread(f"Spawn multiple specialized agents in parallel to solve: {task_prompt}")
+            elif sub == "create":
+                self.append_output("💡 [bold cyan]Create Agent[/bold cyan]: Ask the agent directly: `create an agent named 'auditor' with role 'Smart Contract Auditor' and tools read_file, grep_search`")
+            else:
+                self.append_output("[yellow]Usage: /agent <list|spawn <task>|create>[/yellow]")
+
+        elif root == "/plugin":
+            sub = parts[1].lower() if len(parts) > 1 else "list"
+            if sub == "list":
+                out, _ = execute_tool("manage_plugins", {"action": "list"}, self.harness)
+                p = Panel(Markdown(out), title="🔌 Extensions & Plugins", box=box.ROUNDED, border_style=theme["accent"])
+                self.append_output(render_rich_to_string(p, max_cols=cols))
+            elif sub == "install" and len(parts) >= 3:
+                git_url = parts[2]
+                out, _ = execute_tool("manage_plugins", {"action": "install", "source": git_url}, self.harness)
+                self.append_output(out)
+            elif sub in ["del", "delete"] and len(parts) >= 3:
+                pname = parts[2]
+                out, _ = execute_tool("manage_plugins", {"action": "delete", "name": pname}, self.harness)
+                self.append_output(out)
+            elif sub == "add":
+                self.append_output("💡 [bold cyan]Add Plugin[/bold cyan]: Ask the agent: `create a plugin called my_tool with a tool to fetch crypto prices`")
+            else:
+                self.append_output("[yellow]Usage: /plugin <list|install <git_url>|del <name>|add>[/yellow]")
+
         self.invalidate_ui()
 
     def run_agent_thread(self, user_input: str):
@@ -2452,7 +3318,9 @@ class XDHApp:
             self.harness.compact_context_if_needed()
             tools = TOOLS_SPEC if self.harness.config.get("active_tools") else None
 
-            for turn in range(8):
+            turn = 0
+            while True:
+                turn += 1
                 if self.abort_requested:
                     self.append_history_block({"type": "raw", "text": "[yellow]⚡ Generation halted by user.[/yellow]"})
                     break
@@ -2555,10 +3423,6 @@ class XDHApp:
                 if not final_tools or self.abort_requested:
                     break
 
-                if turn == 7:
-                    self.append_history_block({"type": "raw", "text": "[yellow]⚠ Max tool rounds (8) reached. Continuing in next message.[/yellow]"})
-                    break
-
                 for tc in final_tools:
                     if self.abort_requested:
                         break
@@ -2613,123 +3477,155 @@ class XDHApp:
             self.invalidate_ui()
 
     def harness_stream_call(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None):
-        pdata = self.harness.current_provider_data
-        base_url = pdata.get("base_url", "").rstrip("/")
-        api_key = pdata.get("api_key") or "none"
-        model = pdata.get("default_model", "unknown")
+        max_retries = 5
+        base_retry_delay = 5  # Increases by 5s on each retry (5s, 10s, 15s, 20s, 25s)
 
-        url = f"{base_url}/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if api_key and api_key != "none":
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        payload: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "stream": True,
-            "stream_options": {"include_usage": True}
-        }
-        if tools and self.harness.config.get("active_tools", True):
-            payload["tools"] = tools
-
-        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                tool_calls_map: Dict[int, Dict[str, Any]] = {}
-                inside_think_tag = False
-                stream_usage_tokens = 0
-
-                for raw_line in resp:
-                    if self.abort_requested:
-                        break
-                    line = raw_line.decode("utf-8").strip()
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data_str = line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
-
-                    try:
-                        chunk = json.loads(data_str)
-                    except Exception:
-                        continue
-
-                    usage = chunk.get("usage")
-                    if usage and "total_tokens" in usage:
-                        stream_usage_tokens = usage["total_tokens"]
-
-                    choices = chunk.get("choices", [])
-                    if not choices:
-                        continue
-
-                    delta = choices[0].get("delta", {})
-
-                    reasoning_chunk = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking")
-                    if reasoning_chunk:
-                        yield ("thought", reasoning_chunk, None)
-
-                    delta_tools = delta.get("tool_calls")
-                    if delta_tools:
-                        for dt in delta_tools:
-                            idx = dt.get("index", 0)
-                            if idx not in tool_calls_map:
-                                tool_calls_map[idx] = {"id": dt.get("id", ""), "type": "function", "function": {"name": "", "arguments": ""}}
-                            if dt.get("id"):
-                                tool_calls_map[idx]["id"] = dt["id"]
-                            fn = dt.get("function", {})
-                            if fn.get("name"):
-                                tool_calls_map[idx]["function"]["name"] += fn["name"]
-                            if fn.get("arguments"):
-                                tool_calls_map[idx]["function"]["arguments"] += fn["arguments"]
-
-                    content_chunk = delta.get("content", "")
-                    if content_chunk:
-                        while content_chunk:
-                            if inside_think_tag:
-                                if "</think>" in content_chunk:
-                                    parts = content_chunk.split("</think>", 1)
-                                    if parts[0]:
-                                        yield ("thought", parts[0], None)
-                                    content_chunk = parts[1] if len(parts) > 1 else ""
-                                    inside_think_tag = False
-                                else:
-                                    yield ("thought", content_chunk, None)
-                                    content_chunk = ""
-                            else:
-                                if "<think>" in content_chunk:
-                                    parts = content_chunk.split("<think>", 1)
-                                    if parts[0]:
-                                        yield ("content", parts[0], None)
-                                    content_chunk = parts[1] if len(parts) > 1 else ""
-                                    inside_think_tag = True
-                                else:
-                                    yield ("content", content_chunk, None)
-                                    content_chunk = ""
-
-                if stream_usage_tokens > 0:
-                    self.harness.total_tokens_consumed += stream_usage_tokens
-
-                final_tools = list(tool_calls_map.values()) if tool_calls_map else None
-                yield ("done", "", final_tools)
-
-        except urllib.error.HTTPError as e:
-            err = e.read().decode("utf-8", errors="replace")
-            # Model Fallback: If 429/5xx and alternative provider configured, attempt failover
-            curr_prov = self.harness.config.get("current_provider")
-            all_provs = [p for p in self.harness.config.get("providers", {}).keys() if p != curr_prov]
-            if (e.code in [429, 500, 502, 503]) and all_provs:
-                backup = all_provs[0]
-                self.append_output(f"\n[yellow]⚠️ Provider '{curr_prov}' returned HTTP {e.code}. Auto-failing over to '{backup}'...[/yellow]")
-                self.harness.config["current_provider"] = backup
-                self.harness.save_config()
-                yield from self.harness_stream_call(messages, tools=tools)
-            else:
-                self.append_output(f"\n[API Error {e.code}]: {err}")
+        for attempt in range(1, max_retries + 1):
+            if self.abort_requested:
                 yield ("done", "", None)
-        except Exception as e:
-            self.append_output(f"\n[Network Failure]: {str(e)}")
-            yield ("done", "", None)
+                return
+
+            pdata = self.harness.current_provider_data
+            base_url = pdata.get("base_url", "").rstrip("/")
+            api_key = pdata.get("api_key") or "none"
+            model = pdata.get("default_model", "unknown")
+
+            url = f"{base_url}/chat/completions"
+            headers = {"Content-Type": "application/json"}
+            if api_key and api_key != "none":
+                headers["Authorization"] = f"Bearer {api_key}"
+
+            payload: Dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "stream": True,
+                "stream_options": {"include_usage": True}
+            }
+            if tools and self.harness.config.get("active_tools", True):
+                payload["tools"] = tools
+
+            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    tool_calls_map: Dict[int, Dict[str, Any]] = {}
+                    inside_think_tag = False
+                    stream_usage_tokens = 0
+
+                    for raw_line in resp:
+                        if self.abort_requested:
+                            break
+                        line = raw_line.decode("utf-8").strip()
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            chunk = json.loads(data_str)
+                        except Exception:
+                            continue
+
+                        usage = chunk.get("usage")
+                        if usage and "total_tokens" in usage:
+                            stream_usage_tokens = usage["total_tokens"]
+
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
+
+                        delta = choices[0].get("delta", {})
+
+                        reasoning_chunk = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking")
+                        if reasoning_chunk:
+                            yield ("thought", reasoning_chunk, None)
+
+                        delta_tools = delta.get("tool_calls")
+                        if delta_tools:
+                            for dt in delta_tools:
+                                idx = dt.get("index", 0)
+                                if idx not in tool_calls_map:
+                                    tool_calls_map[idx] = {"id": dt.get("id", ""), "type": "function", "function": {"name": "", "arguments": ""}}
+                                if dt.get("id"):
+                                    tool_calls_map[idx]["id"] = dt["id"]
+                                fn = dt.get("function", {})
+                                if fn.get("name"):
+                                    tool_calls_map[idx]["function"]["name"] += fn["name"]
+                                if fn.get("arguments"):
+                                    tool_calls_map[idx]["function"]["arguments"] += fn["arguments"]
+
+                        content_chunk = delta.get("content", "")
+                        if content_chunk:
+                            while content_chunk:
+                                if inside_think_tag:
+                                    if "</think>" in content_chunk:
+                                        parts = content_chunk.split("</think>", 1)
+                                        if parts[0]:
+                                            yield ("thought", parts[0], None)
+                                        content_chunk = parts[1] if len(parts) > 1 else ""
+                                        inside_think_tag = False
+                                    else:
+                                        yield ("thought", content_chunk, None)
+                                        content_chunk = ""
+                                else:
+                                    if "<think>" in content_chunk:
+                                        parts = content_chunk.split("<think>", 1)
+                                        if parts[0]:
+                                            yield ("content", parts[0], None)
+                                        content_chunk = parts[1] if len(parts) > 1 else ""
+                                        inside_think_tag = True
+                                    else:
+                                        yield ("content", content_chunk, None)
+                                        content_chunk = ""
+
+                    if stream_usage_tokens > 0:
+                        self.harness.total_tokens_consumed += stream_usage_tokens
+
+                    final_tools = list(tool_calls_map.values()) if tool_calls_map else None
+                    yield ("done", "", final_tools)
+                    return
+
+            except urllib.error.HTTPError as e:
+                err = e.read().decode("utf-8", errors="replace")
+                curr_prov = self.harness.config.get("current_provider")
+                all_provs = [p for p in self.harness.config.get("providers", {}).keys() if p != curr_prov]
+
+                # If server rate limit / overloaded (429/5xx), try failover if alternative provider exists
+                if (e.code in [429, 500, 502, 503]) and all_provs:
+                    backup = all_provs[0]
+                    self.append_output(f"\n[yellow]⚠️ Provider '{curr_prov}' HTTP {e.code}. Failover to '{backup}'...[/yellow]")
+                    self.harness.config["current_provider"] = backup
+                    self.harness.save_config()
+                    yield from self.harness_stream_call(messages, tools=tools)
+                    return
+
+                # Retry connection errors / server errors up to 5 times
+                if attempt < max_retries and e.code in [429, 500, 502, 503, 504]:
+                    delay = attempt * base_retry_delay
+                    self.append_output(f"\n[yellow]⚠️ HTTP {e.code} error. Retrying attempt {attempt}/{max_retries} in {delay}s...[/yellow]")
+                    time.sleep(delay)
+                    continue
+                else:
+                    self.append_output(f"\n[API Error {e.code}]: {err}")
+                    yield ("done", "", None)
+                    return
+
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as net_err:
+                if attempt < max_retries:
+                    delay = attempt * base_retry_delay
+                    self.append_output(f"\n[yellow]⚠️ Connection failed ({str(net_err)}). Retrying attempt {attempt}/{max_retries} in {delay}s...[/yellow]")
+                    time.sleep(delay)
+                    continue
+                else:
+                    self.append_output(f"\n[Network Failure]: Connection failed after {max_retries} attempts: {str(net_err)}")
+                    yield ("done", "", None)
+                    return
+
+            except Exception as ex:
+                self.append_output(f"\n[Unexpected Error]: {str(ex)}")
+                yield ("done", "", None)
+                return
 
 # ---------------------------------------------------------
 # Entrypoint

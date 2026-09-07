@@ -25,7 +25,7 @@
   ╚██╗██╔╝██╔══██╗██║  ██║
    ╚███╔╝ ██║  ██║███████║
    ██╔██╗ ██║  ██║██╔══██║
-  ██╔╝ ██╗██████╔╝██║  ██║   xdharness v1.0.1
+  ██╔╝ ██╗██████╔╝██║  ██║   xdharness v1.0.2
 ```
 
 ---
@@ -33,15 +33,13 @@
 ## 🚀 Features
 
 - 🖥️ **3-Segment Layout**: Real-time context header (tokens, RAM, latency, provider/model), scrollable history viewport with collapsible blocks, and dynamic multi-line composer.
-- 🔄 **Multi-Provider Failover**: Native streaming integration with OpenAI, OpenRouter, Anthropic, DeepSeek, Groq, Ollama, LM Studio, and more. Automatically fails over to backup providers on rate limits (429) or server errors (5xx).
-- 🛠️ **Autonomous Agent Tools**:
-  - `bash_run`: Sandboxed execution with timeout and output capture.
-  - `read_file` & `write_file`: Atomic file read/write with automatic backup generation.
-  - `edit_file`: Smart fuzzy matching and targeted block replacement.
-  - `diff_files` & `/apply`: Unified diff generator and staged hunk applicator.
-  - `web_search` & `web_fetch`: DuckDuckGo query integration and readable text extraction.
-  - `bg_task`: Background task runner with detached output streams.
-  - `tree_view`: Directory visualizer with gitignore-awareness.
+- 🎯 **Reusable Skills System**: Built-in `create_skill` & `call_skill` engine. Define, discover, and run skills via `/skill list`, `/skill run <name>`, or autonomous agent calls.
+- 🤖 **Multi-Agent Orchestration**: Built-in `create_agent` & `spawn_agents`. Launch multiple specialized subagents (researcher, coder, tester, reviewer, custom personas) concurrently in parallel threads to solve tasks cooperatively.
+- 🔌 **Dynamic Plugin Management**: Add, install from git repositories, delete, and manage community or personal plugins via `/plugin` and autonomous tool injection into `TOOLS_SPEC`.
+- ❓ **Interactive User Question Prompting**: Agents can invoke `ask_question` with selectable options to clarify ambiguity during execution, awaiting user input before proceeding.
+- ⚡ **Mid-Run User Guidance Interruption**: Send a message or press `ESC` / `Ctrl+C` while an agent is executing to immediately pause, incorporate guidance (e.g. "don't do that, do this instead"), and pivot smoothly.
+- 🛡️ **Fault-Tolerant Resilience**: 5-stage connection retry backoff (increasing by +5s intervals: 5s, 10s, 15s, 20s, 25s) with automatic failover between LLM providers.
+- ♾️ **Unconstrained Autonomous Execution**: Removed artificial tool round limits for complex, hundreds-step autonomous pipelines.
 - 🎨 **7 Curated Color Palettes**: `tokyo_night`, `dracula`, `catppuccin`, `monokai`, `nord`, `cyberpunk`, and `gruvbox`.
 - 📱 **Mobile & Termux First**: Smooth step-scroll animation for touch gestures, compact mini-banners for narrow viewports (<70 cols), and zero heavy C-extension dependencies.
 - 🧠 **Context Optimization**: Automatic message history compaction when nearing token capacity thresholds.
