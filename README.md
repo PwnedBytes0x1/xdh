@@ -167,6 +167,15 @@ flowchart TD
 
 ---
 
+## 🤝 Contributing & Community
+
+Contributions are welcome! Please review our community guidelines before getting started:
+- 📜 **[Code of Conduct](CODE_OF_CONDUCT.md)**
+- 💡 **[Contributing Guide](CONTRIBUTING.md)**
+- 🔒 **[Security Policy](SECURITY.md)**
+
+---
+
 ## 📄 License
 
 This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
