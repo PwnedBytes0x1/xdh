@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xdharness"
-version = "1.0.5"
+version = "1.0.6"
 description = "xdh (xdharness) - Autonomous Terminal Agent Harness & TUI for Android Termux, Linux, macOS, and Windows"
 readme = "README.md"
 license = "MIT"

@@ -6,7 +6,7 @@ Features: 3-Segment Layout, Micro-Action Badges, Context Ghost-Suggest,
 Dynamic Expanding Composer, and Interactive Settings.
 """
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 import os
 import sys
@@ -444,10 +444,13 @@ class DynamicContextAutoSuggest(AutoSuggest):
 # Viewport Controller
 # ---------------------------------------------------------
 class ScrollingANSIControl(UIControl):
-    def __init__(self, get_text_func, get_cursor_func=None, mouse_scroll_func=None):
+    def __init__(self, get_text_func, get_cursor_func=None, mouse_scroll_func=None, get_lines_func=None):
         self.get_text_func = get_text_func
         self.get_cursor_func = get_cursor_func
         self.mouse_scroll_func = mouse_scroll_func
+        self.get_lines_func = get_lines_func
+        self._cached_raw = None
+        self._cached_lines = [[]]
 
     def is_focusable(self) -> bool:
         return False
@@ -463,9 +466,20 @@ class ScrollingANSIControl(UIControl):
         return NotImplemented
 
     def create_content(self, width: int, height: int) -> UIContent:
-        raw_text = self.get_text_func()
-        formatted_text = to_formatted_text(ANSI(raw_text))
-        lines = list(split_lines(formatted_text))
+        if self.get_lines_func is not None:
+            lines = self.get_lines_func()
+        else:
+            raw_text = self.get_text_func()
+            if raw_text == self._cached_raw:
+                lines = self._cached_lines
+            else:
+                formatted_text = to_formatted_text(ANSI(raw_text))
+                lines = list(split_lines(formatted_text))
+                if not lines:
+                    lines = [[]]
+                self._cached_raw = raw_text
+                self._cached_lines = lines
+
         if not lines:
             lines = [[]]
 
@@ -2609,6 +2623,8 @@ class XDHApp:
         self.spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self.spinner_index = 0
         self.buffer_text = ""
+        self.base_lines: List[Any] = []
+        self.stream_lines: List[Any] = []
         self.scroll_offset = 0
         self.history_blocks: List[Dict[str, Any]] = []
         self.collapsed_state: bool = False
@@ -2630,10 +2646,25 @@ class XDHApp:
             target_y = max(0, total_lines - 1 - self.scroll_offset)
             return Point(x=0, y=target_y)
 
+        def get_all_viewport_lines() -> List[Any]:
+            with self.lock:
+                if self.stream_lines:
+                    if self.base_lines:
+                        return self.base_lines + [[]] + self.stream_lines
+                    return self.stream_lines
+                if self.base_lines:
+                    return self.base_lines
+                if self.buffer_text:
+                    fmt = to_formatted_text(ANSI(self.buffer_text))
+                    lines = list(split_lines(fmt))
+                    return lines if lines else [[]]
+                return [[]]
+
         self.viewport_control = ScrollingANSIControl(
             lambda: self.buffer_text,
             get_cursor_func=get_viewport_cursor,
-            mouse_scroll_func=self.smooth_scroll_by
+            mouse_scroll_func=self.smooth_scroll_by,
+            get_lines_func=get_all_viewport_lines
         )
         self.viewport_window = Window(
             content=self.viewport_control,
@@ -2734,6 +2765,8 @@ class XDHApp:
             with self.lock:
                 self.history_blocks = []
                 self.buffer_text = ""
+                self.base_lines = []
+                self.stream_lines = []
                 self.scroll_offset = 0
             self.invalidate_ui()
 
@@ -3356,21 +3389,35 @@ class XDHApp:
             rendered = self.render_block(item, cols)
             if rendered:
                 rendered_pieces.append(rendered)
+        new_text = "\n".join(rendered_pieces)
+        new_lines = list(split_lines(to_formatted_text(ANSI(new_text)))) if new_text else []
         with self.lock:
-            self.buffer_text = "\n".join(rendered_pieces)
+            self.buffer_text = new_text
+            self.base_lines = new_lines
+            self.stream_lines = []
             self.scroll_offset = 0
         self.invalidate_ui()
 
     def append_history_block(self, item: Dict[str, Any]):
-        """Adds a structured history item, renders it, and updates buffer_text."""
+        """Adds a structured history item, renders it, and updates buffer_text and base_lines incrementally."""
         cols, _ = self.get_term_size()
         rendered = self.render_block(item, cols)
+        chunk_lines = list(split_lines(to_formatted_text(ANSI(rendered)))) if rendered else []
         with self.lock:
             self.history_blocks.append(item)
             if self.buffer_text:
                 self.buffer_text += "\n" + rendered
             else:
                 self.buffer_text = rendered
+
+            if chunk_lines:
+                if self.base_lines:
+                    self.base_lines.append([])  # newline separator between blocks
+                    self.base_lines.extend(chunk_lines)
+                else:
+                    self.base_lines = chunk_lines
+
+            self.stream_lines = []
             self.scroll_offset = 0
         self.invalidate_ui()
 
@@ -4054,9 +4101,6 @@ class XDHApp:
                 accumulated_content = ""
                 final_tools = None
 
-                with self.lock:
-                    checkpoint_len = len(self.buffer_text)
-
                 last_ui_update = 0.0
                 turn_timestamp = time.strftime("%H:%M:%S")
 
@@ -4073,16 +4117,26 @@ class XDHApp:
 
                     now = time.time()
                     is_final = (token_type == "done")
-                    if (now - last_ui_update >= 0.05) or is_final:
+                    if (now - last_ui_update >= 0.10) or is_final:
                         last_ui_update = now
                         cols, _ = self.get_term_size()
 
                         # Live stream blocks preview
                         render_blocks = []
                         if accumulated_thought and self.harness.config.get("show_thinking"):
+                            thought_lines = accumulated_thought.splitlines()
+                            total_thought_lines = len(thought_lines)
+                            if total_thought_lines > 50:
+                                preview_lines = thought_lines[-40:]
+                                preview_thought = f"… [dim](omitted first {total_thought_lines - 40} lines while streaming)[/dim]\n" + "\n".join(preview_lines)
+                                title_extra = f" (line {total_thought_lines})"
+                            else:
+                                preview_thought = accumulated_thought
+                                title_extra = ""
+
                             thought_panel = Panel(
-                                Text(accumulated_thought, style=f"dim {theme['warning']}"),
-                                title=f"⚡ Thinking {turn_timestamp}",
+                                Text.from_markup(preview_thought) if preview_thought.startswith("… [dim]") else Text(preview_thought, style=f"dim {theme['warning']}"),
+                                title=f"⚡ Thinking {turn_timestamp}{title_extra}",
                                 box=box.ROUNDED,
                                 border_style=theme["warning"],
                                 padding=(0, 1)
@@ -4102,27 +4156,31 @@ class XDHApp:
 
                         if render_blocks:
                             combined = "\n".join(render_blocks)
+                            parsed_stream = list(split_lines(to_formatted_text(ANSI(combined)))) if combined else []
                             with self.lock:
-                                base = self.buffer_text[:checkpoint_len]
-                                sep = "\n" if (base and combined) else ""
-                                self.buffer_text = base + sep + combined
+                                self.stream_lines = parsed_stream
                                 self.scroll_offset = 0
                             self.invalidate_ui()
 
                 if self.abort_requested:
+                    with self.lock:
+                        self.stream_lines = []
                     self.append_history_block({"type": "raw", "text": "[yellow]⚡ Turn cancelled by user.[/yellow]"})
                     break
 
-                # Permanently store finalized thinking and content in history_blocks
+                # Clear active stream lines and append finalized blocks to history
+                with self.lock:
+                    self.stream_lines = []
+
                 curr_model = self.harness.current_provider_data.get("default_model", "assistant")
                 if accumulated_thought and self.harness.config.get("show_thinking"):
-                    self.history_blocks.append({
+                    self.append_history_block({
                         "type": "thought",
                         "content": accumulated_thought,
                         "timestamp": turn_timestamp
                     })
                 if accumulated_content:
-                    self.history_blocks.append({
+                    self.append_history_block({
                         "type": "assistant",
                         "content": accumulated_content,
                         "model": curr_model,
