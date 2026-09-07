@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xdharness"
+version = "1.0.0"
+description = "xdh (xdharness) - Autonomous Terminal Agent Harness & TUI for Android Termux, Linux, macOS, and Windows"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [
+    { name = "PwnedBytes0x1", email = "pwnedbytes@gmail.com" }
+]
+keywords = [
+    "ai",
+    "agent",
+    "terminal",
+    "tui",
+    "cli",
+    "llm",
+    "termux",
+    "developer-tools",
+    "prompt-toolkit",
+    "rich"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: User Interfaces",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: Console",
+]
+dependencies = [
+    "prompt_toolkit>=3.0.36",
+    "rich>=13.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/PwnedBytes0x1/xdh"
+Documentation = "https://github.com/PwnedBytes0x1/xdh/tree/main/docs/wiki"
+Repository = "https://github.com/PwnedBytes0x1/xdh.git"
+Issues = "https://github.com/PwnedBytes0x1/xdh/issues"
+
+[project.scripts]
+xdh = "xdh:main"
+xdharness = "xdh:main"
+
+[tool.setuptools]
+py-modules = ["xdh"]
