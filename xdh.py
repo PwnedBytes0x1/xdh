@@ -251,31 +251,37 @@ def get_memory_usage_mb() -> float:
     except Exception:
         return 0.0
 
+_CACHED_CLIPBOARD_CMD: Optional[str] = None
+
 def copy_to_clipboard(text: str) -> bool:
-    """Cross-platform clipboard copy (Termux, xclip, wl-copy, pbcopy, Windows)."""
-    try:
-        if shutil.which("termux-clipboard-set"):
-            p = subprocess.Popen(["termux-clipboard-set"], stdin=subprocess.PIPE)
-            p.communicate(input=text.encode("utf-8"))
-            return p.returncode == 0
-        elif shutil.which("wl-copy"):
-            p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
-            p.communicate(input=text.encode("utf-8"))
-            return p.returncode == 0
-        elif shutil.which("xclip"):
-            p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE)
-            p.communicate(input=text.encode("utf-8"))
-            return p.returncode == 0
-        elif shutil.which("pbcopy"):
-            p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-            p.communicate(input=text.encode("utf-8"))
-            return p.returncode == 0
-        elif sys.platform == "win32":
-            p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=True)
-            p.communicate(input=text.encode("utf-8"))
-            return p.returncode == 0
-    except Exception:
-        pass
+    """Fast cross-platform clipboard copy with tool caching (Termux, xclip, wl-copy, pbcopy, Windows)."""
+    global _CACHED_CLIPBOARD_CMD
+    candidates = ["termux-clipboard-set", "wl-copy", "xclip", "pbcopy", "clip"]
+    if _CACHED_CLIPBOARD_CMD:
+        candidates = [_CACHED_CLIPBOARD_CMD] + [c for c in candidates if c != _CACHED_CLIPBOARD_CMD]
+
+    for tool in candidates:
+        if tool == "clip" and sys.platform == "win32":
+            try:
+                p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=True)
+                p.communicate(input=text.encode("utf-8"), timeout=1.5)
+                if p.returncode == 0:
+                    _CACHED_CLIPBOARD_CMD = "clip"
+                    return True
+            except Exception:
+                pass
+        elif shutil.which(tool):
+            cmd = [tool]
+            if tool == "xclip":
+                cmd = ["xclip", "-selection", "clipboard"]
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                p.communicate(input=text.encode("utf-8"), timeout=1.5)
+                if p.returncode == 0:
+                    _CACHED_CLIPBOARD_CMD = tool
+                    return True
+            except Exception:
+                pass
     return False
 
 def estimate_session_cost(model_name: str, total_tokens: int) -> float:
@@ -385,10 +391,17 @@ class BackgroundTaskManager:
 
 BG_TASKS = BackgroundTaskManager()
 
+_CONSOLE_CACHE = threading.local()
+
 def render_rich_to_string(renderable: Any, max_cols: int = 80) -> str:
-    capture_console = Console(width=max(20, max_cols), force_terminal=True, color_system="truecolor")
-    with capture_console.capture() as capture:
-        capture_console.print(renderable)
+    cols = max(20, max_cols)
+    console = getattr(_CONSOLE_CACHE, "console", None)
+    if console is None or getattr(_CONSOLE_CACHE, "cols", None) != cols:
+        console = Console(width=cols, force_terminal=True, color_system="truecolor", highlight=False)
+        _CONSOLE_CACHE.console = console
+        _CONSOLE_CACHE.cols = cols
+    with console.capture() as capture:
+        console.print(renderable)
     return capture.get().rstrip("\n")
 
 # ---------------------------------------------------------
@@ -1259,30 +1272,32 @@ class MCPManager:
         self.config_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def start_servers(self):
-        """Initializes and connects to all configured stdio MCP servers."""
-        for sname, scfg in list(self.servers.items()):
-            cmd = scfg.get("command")
-            args = scfg.get("args", [])
-            env = dict(os.environ)
-            if scfg.get("env"):
-                env.update(scfg["env"])
-            if not cmd:
-                continue
-            try:
-                full_cmd = [cmd] + args
-                proc = subprocess.Popen(
-                    full_cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                    env=env
-                )
-                self.active_processes[sname] = proc
-                self._initialize_and_discover(sname, proc)
-            except Exception:
-                pass
+        """Initializes and connects to all configured stdio MCP servers asynchronously in the background."""
+        def _bg_launcher():
+            for sname, scfg in list(self.servers.items()):
+                cmd = scfg.get("command")
+                args = scfg.get("args", [])
+                env = dict(os.environ)
+                if scfg.get("env"):
+                    env.update(scfg["env"])
+                if not cmd:
+                    continue
+                try:
+                    full_cmd = [cmd] + args
+                    proc = subprocess.Popen(
+                        full_cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
+                        env=env
+                    )
+                    self.active_processes[sname] = proc
+                    self._initialize_and_discover(sname, proc)
+                except Exception:
+                    pass
+        threading.Thread(target=_bg_launcher, daemon=True).start()
 
     def _send_rpc(self, proc: subprocess.Popen, method: str, params: Optional[Dict[str, Any]] = None, req_id: int = 1) -> Optional[Dict[str, Any]]:
         req = {
@@ -1943,8 +1958,23 @@ def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[s
                 return "Error: Empty query.", "🔍 Search › [Empty]"
             search_root = Path(args.get("path") or ".").expanduser()
             case_ins = args.get("case_insensitive", True)
-            flags = re.IGNORECASE if case_ins else 0
 
+            # Fast path: Native ripgrep (rg) if present
+            if shutil.which("rg"):
+                rg_cmd = ["rg", "-n", "--max-count", "40"]
+                if case_ins:
+                    rg_cmd.append("-i")
+                rg_cmd.extend(["-g", "!{.git,node_modules,__pycache__,.venv,.xdharness}*"])
+                rg_cmd.extend([query, str(search_root)])
+                try:
+                    res = subprocess.run(rg_cmd, capture_output=True, text=True, timeout=15)
+                    lines = [l.strip() for l in res.stdout.splitlines() if l.strip()][:40]
+                    if lines:
+                        return "\n".join(lines), f"🔍 Grep (rg) › [bold yellow]{query}[/bold yellow] [dim]({len(lines)} matches)[/dim]"
+                except Exception:
+                    pass
+
+            flags = re.IGNORECASE if case_ins else 0
             matches = []
             regex = re.compile(query, flags)
             ign_patterns = get_ignored_patterns(search_root if search_root.is_dir() else search_root.parent)
@@ -3182,8 +3212,12 @@ class XDHApp:
             ("class:frame", "─╯"),
         ]
 
-    def invalidate_ui(self):
-        """Thread-safe UI invalidation."""
+    def invalidate_ui(self, force: bool = False):
+        """Thread-safe, 30fps-debounced UI invalidation to eliminate frame lag and terminal repaint storms."""
+        now = time.monotonic()
+        if not force and (now - getattr(self, "_last_invalidate", 0.0)) < 0.033:
+            return
+        self._last_invalidate = now
         try:
             loop = getattr(self.app, "loop", None)
             if loop and loop.is_running():
