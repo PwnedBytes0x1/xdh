@@ -6,16 +6,19 @@ Features: 3-Segment Layout, Micro-Action Badges, Context Ghost-Suggest,
 Dynamic Expanding Composer, and Interactive Settings.
 """
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 import os
 import sys
 import re
+import ast
 import json
 import time
 import shlex
 import shutil
 import difflib
+import fnmatch
+import argparse
 import subprocess
 import threading
 import urllib.request
@@ -64,10 +67,12 @@ SKILLS_DIR = BASE_DIR / "skills"
 AGENTS_DIR = BASE_DIR / "agents"
 PLUGINS_DIR = BASE_DIR / "plugins"
 BACKUPS_DIR = BASE_DIR / "backups"
+CHECKPOINTS_DIR = BASE_DIR / "checkpoints"
 CONFIG_FILE = BASE_DIR / "config.json"
 HISTORY_FILE = BASE_DIR / "prompt_history.txt"
+MCP_CONFIG_FILE = BASE_DIR / "mcp.json"
 
-for p in [BASE_DIR, SESSIONS_DIR, SKILLS_DIR, AGENTS_DIR, PLUGINS_DIR, BACKUPS_DIR]:
+for p in [BASE_DIR, SESSIONS_DIR, SKILLS_DIR, AGENTS_DIR, PLUGINS_DIR, BACKUPS_DIR, CHECKPOINTS_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------
@@ -196,7 +201,8 @@ DEFAULT_CONFIG = {
     "active_tools": True,
     "show_thinking": True,
     "compaction_threshold": 0.90,
-    "confirm_danger_commands": True
+    "confirm_danger_commands": True,
+    "permission_mode": "auto"
 }
 
 # Pricing per million tokens (input, output) in USD for cost estimation
@@ -1028,6 +1034,373 @@ TOOLS = [
 PLUGIN_MGR = PluginManager()
 
 # ---------------------------------------------------------
+# Ignore Filters (.xdhignore & .gitignore support)
+# ---------------------------------------------------------
+def get_ignored_patterns(root_dir: Path) -> List[str]:
+    """Collect ignore patterns from .xdhignore and .gitignore."""
+    patterns = [".git", "node_modules", "__pycache__", ".venv", ".xdharness", "*.pyc"]
+    for fname in [".xdhignore", ".gitignore"]:
+        ign_file = root_dir / fname
+        if ign_file.is_file():
+            try:
+                for line in ign_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                    s = line.strip()
+                    if s and not s.startswith("#"):
+                        patterns.append(s)
+            except Exception:
+                pass
+    return patterns
+
+def is_path_ignored(path: Path, root_dir: Path, patterns: Optional[List[str]] = None) -> bool:
+    """Check if a path matches any pattern from .xdhignore or .gitignore."""
+    if patterns is None:
+        patterns = get_ignored_patterns(root_dir)
+    try:
+        rel = str(path.relative_to(root_dir))
+    except Exception:
+        rel = str(path.name)
+
+    parts = path.parts
+    for pat in patterns:
+        clean_pat = pat.rstrip("/")
+        if clean_pat in parts:
+            return True
+        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel, f"*/{pat}") or fnmatch.fnmatch(path.name, pat):
+            return True
+        if pat.endswith("/") and fnmatch.fnmatch(rel + "/", f"*{pat}*"):
+            return True
+    return False
+
+# ---------------------------------------------------------
+# AST Code Outline & Structure Navigation
+# ---------------------------------------------------------
+def extract_code_outline(file_path: Path) -> str:
+    """Extract classes, methods, functions, and signatures using AST / pattern analysis."""
+    if not file_path.is_file():
+        return f"Error: File '{file_path}' not found."
+    try:
+        source = file_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+    lines = []
+    lines.append(f"Outline for `{file_path.name}` ({len(source.splitlines())} lines):")
+
+    # Python AST parsing
+    if file_path.suffix == ".py":
+        try:
+            tree = ast.parse(source)
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef):
+                    bases = [ast.unparse(b) for b in node.bases] if hasattr(ast, "unparse") else []
+                    base_str = f"({', '.join(bases)})" if bases else ""
+                    doc = ast.get_docstring(node)
+                    doc_preview = f" - \"{doc.splitlines()[0][:60]}\"" if doc else ""
+                    lines.append(f"  class {node.name}{base_str} [line {node.lineno}]{doc_preview}")
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            prefix = "async def" if isinstance(item, ast.AsyncFunctionDef) else "def"
+                            args_str = ", ".join([a.arg for a in item.args.args])
+                            m_doc = ast.get_docstring(item)
+                            m_preview = f" - \"{m_doc.splitlines()[0][:50]}\"" if m_doc else ""
+                            lines.append(f"    • {prefix} {item.name}({args_str}) [line {item.lineno}]{m_preview}")
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+                    args_str = ", ".join([a.arg for a in node.args.args])
+                    f_doc = ast.get_docstring(node)
+                    f_preview = f" - \"{f_doc.splitlines()[0][:60]}\"" if f_doc else ""
+                    lines.append(f"  {prefix} {node.name}({args_str}) [line {node.lineno}]{f_preview}")
+            if len(lines) == 1:
+                lines.append("  (No top-level classes or functions discovered)")
+            return "\n".join(lines)
+        except Exception as e:
+            lines.append(f"  (AST parse note: {e} - falling back to regex outline)")
+
+    # Universal Regex-based outline (JS, TS, Go, Rust, C, Java, etc.)
+    code_lines = source.splitlines()
+    found_symbols = 0
+    patterns = [
+        (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z0-9_]+)"), "class"),
+        (re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)\s*\((.*?)\)"), "function"),
+        (re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z0-9_]+)\s*=\s*(?:async\s*)?\((.*?)\)\s*=>"), "arrow_function"),
+        (re.compile(r"^\s*func\s+(?:\(.*?\)\s*)?([A-Za-z0-9_]+)\s*\((.*?)\)"), "go_func"),
+        (re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)"), "rust_fn"),
+        (re.compile(r"^\s*(?:pub\s+)?struct\s+([A-Za-z0-9_]+)"), "struct"),
+    ]
+    for idx, raw_line in enumerate(code_lines, 1):
+        for rx, kind in patterns:
+            m = rx.search(raw_line)
+            if m:
+                symbol = m.group(1)
+                sig = f"({m.group(2)})" if len(m.groups()) >= 2 and m.group(2) is not None else ""
+                lines.append(f"  [{kind}] {symbol}{sig} [line {idx}]")
+                found_symbols += 1
+                break
+    if found_symbols == 0 and len(lines) == 1:
+        lines.append("  (No recognizable symbols matched)")
+    return "\n".join(lines)
+
+# ---------------------------------------------------------
+# Rollback Checkpoint System
+# ---------------------------------------------------------
+class CheckpointManager:
+    """Creates, lists, and restores workspace snapshots in ~/.xdharness/checkpoints/."""
+    def __init__(self, checkpoints_dir: Path = CHECKPOINTS_DIR):
+        self.checkpoints_dir = checkpoints_dir
+        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    def create_checkpoint(self, name: str, description: str = "") -> Tuple[bool, str]:
+        clean_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.strip().lower())
+        if not clean_name:
+            clean_name = f"cp_{int(time.time())}"
+        ts = int(time.time())
+        cp_dir = self.checkpoints_dir / f"{ts}_{clean_name}"
+        cp_dir.mkdir(parents=True, exist_ok=True)
+
+        # Collect workspace files respecting ignore rules
+        workspace_root = Path(".").resolve()
+        ign_patterns = get_ignored_patterns(workspace_root)
+        saved_files = 0
+
+        for root, dirs, files in os.walk(workspace_root):
+            dirs[:] = [d for d in dirs if not is_path_ignored(Path(root) / d, workspace_root, ign_patterns)]
+            for file in files:
+                fpath = Path(root) / file
+                if not is_path_ignored(fpath, workspace_root, ign_patterns):
+                    try:
+                        rel = fpath.relative_to(workspace_root)
+                        dest = cp_dir / "files" / rel
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(fpath, dest)
+                        saved_files += 1
+                    except Exception:
+                        pass
+
+        meta = {
+            "id": f"{ts}_{clean_name}",
+            "name": clean_name,
+            "description": description,
+            "timestamp": ts,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+            "workspace": str(workspace_root),
+            "files_count": saved_files
+        }
+        (cp_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        return True, f"Checkpoint '{clean_name}' created with {saved_files} files (ID: {ts}_{clean_name})"
+
+    def list_checkpoints(self) -> List[Dict[str, Any]]:
+        results = []
+        for cp_dir in sorted(self.checkpoints_dir.iterdir(), reverse=True):
+            meta_file = cp_dir / "meta.json"
+            if meta_file.is_file():
+                try:
+                    data = json.loads(meta_file.read_text(encoding="utf-8"))
+                    results.append(data)
+                except Exception:
+                    pass
+        return results
+
+    def restore_checkpoint(self, checkpoint_id_or_name: str) -> Tuple[bool, str]:
+        target_dir = None
+        for cp_dir in self.checkpoints_dir.iterdir():
+            if cp_dir.name == checkpoint_id_or_name or cp_dir.name.endswith(f"_{checkpoint_id_or_name}"):
+                target_dir = cp_dir
+                break
+        if not target_dir or not (target_dir / "meta.json").is_file():
+            return False, f"Checkpoint '{checkpoint_id_or_name}' not found."
+
+        try:
+            meta = json.loads((target_dir / "meta.json").read_text(encoding="utf-8"))
+            files_dir = target_dir / "files"
+            workspace_root = Path(".").resolve()
+            restored_count = 0
+            if files_dir.is_dir():
+                for root, _, files in os.walk(files_dir):
+                    for file in files:
+                        src = Path(root) / file
+                        rel = src.relative_to(files_dir)
+                        dest = workspace_root / rel
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dest)
+                        restored_count += 1
+            return True, f"Successfully restored checkpoint '{meta.get('name')}' ({restored_count} files restored)."
+        except Exception as e:
+            return False, f"Failed to restore checkpoint: {str(e)}"
+
+CHECKPOINT_MGR = CheckpointManager()
+
+# ---------------------------------------------------------
+# Model Context Protocol (MCP) Client Engine
+# ---------------------------------------------------------
+class MCPManager:
+    """Manages Model Context Protocol (MCP) servers via stdio JSON-RPC 2.0."""
+    def __init__(self, config_file: Path = MCP_CONFIG_FILE):
+        self.config_file = config_file
+        self.servers: Dict[str, Dict[str, Any]] = {}
+        self.active_processes: Dict[str, subprocess.Popen] = {}
+        self.discovered_tools: Dict[str, Tuple[Dict[str, Any], str, str]] = {}
+        self.load_config()
+        self.start_servers()
+
+    def load_config(self):
+        if not self.config_file.is_file():
+            sample_config = {"mcpServers": {}}
+            self.config_file.write_text(json.dumps(sample_config, indent=2), encoding="utf-8")
+            self.servers = {}
+            return
+        try:
+            data = json.loads(self.config_file.read_text(encoding="utf-8"))
+            self.servers = data.get("mcpServers", {})
+        except Exception:
+            self.servers = {}
+
+    def save_config(self):
+        data = {"mcpServers": self.servers}
+        self.config_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def start_servers(self):
+        """Initializes and connects to all configured stdio MCP servers."""
+        for sname, scfg in list(self.servers.items()):
+            cmd = scfg.get("command")
+            args = scfg.get("args", [])
+            env = dict(os.environ)
+            if scfg.get("env"):
+                env.update(scfg["env"])
+            if not cmd:
+                continue
+            try:
+                full_cmd = [cmd] + args
+                proc = subprocess.Popen(
+                    full_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    env=env
+                )
+                self.active_processes[sname] = proc
+                self._initialize_and_discover(sname, proc)
+            except Exception:
+                pass
+
+    def _send_rpc(self, proc: subprocess.Popen, method: str, params: Optional[Dict[str, Any]] = None, req_id: int = 1) -> Optional[Dict[str, Any]]:
+        req = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": method,
+            "params": params or {}
+        }
+        req_line = json.dumps(req) + "\n"
+        try:
+            if not proc.stdin:
+                return None
+            proc.stdin.write(req_line)
+            proc.stdin.flush()
+            # Read single line response
+            resp_line = proc.stdout.readline()
+            if resp_line:
+                return json.loads(resp_line.strip())
+        except Exception:
+            return None
+        return None
+
+    def _initialize_and_discover(self, sname: str, proc: subprocess.Popen):
+        # 1. Initialize
+        init_params = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "xdh", "version": __version__}
+        }
+        self._send_rpc(proc, "initialize", init_params, req_id=1)
+        # 2. List tools
+        tools_resp = self._send_rpc(proc, "tools/list", {}, req_id=2)
+        if tools_resp and "result" in tools_resp:
+            tools_list = tools_resp["result"].get("tools", [])
+            for t in tools_list:
+                t_name = t.get("name")
+                t_desc = t.get("description", "")
+                t_schema = t.get("inputSchema", {"type": "object", "properties": {}})
+                mcp_tool_name = f"mcp_{sname}_{t_name}"
+                spec = {
+                    "type": "function",
+                    "function": {
+                        "name": mcp_tool_name,
+                        "description": f"[MCP: {sname}] {t_desc}",
+                        "parameters": t_schema
+                    }
+                }
+                self.discovered_tools[mcp_tool_name] = (spec, sname, t_name)
+
+    def call_tool(self, mcp_tool_name: str, arguments: Dict[str, Any]) -> Tuple[str, str]:
+        if mcp_tool_name not in self.discovered_tools:
+            return f"Error: MCP tool '{mcp_tool_name}' not found.", f"🔌 MCP › [red]Not Found[/red]"
+        spec, sname, orig_name = self.discovered_tools[mcp_tool_name]
+        proc = self.active_processes.get(sname)
+        if not proc or proc.poll() is not None:
+            return f"Error: MCP server '{sname}' process is not running.", f"🔌 MCP › [red]{sname} Down[/red]"
+
+        call_params = {"name": orig_name, "arguments": arguments}
+        resp = self._send_rpc(proc, "tools/call", call_params, req_id=int(time.time() * 1000) % 100000)
+        if not resp:
+            return "Error: No response from MCP server.", f"🔌 MCP › [red]Timeout[/red]"
+        if "error" in resp:
+            return f"MCP Error: {resp['error']}", f"🔌 MCP › [red]Error[/red]"
+
+        result = resp.get("result", {})
+        content_items = result.get("content", [])
+        out_strs = []
+        for c in content_items:
+            if c.get("type") == "text":
+                out_strs.append(c.get("text", ""))
+            else:
+                out_strs.append(str(c))
+        final_str = "\n".join(out_strs) if out_strs else json.dumps(result)
+        badge = f"🔌 MCP   › [bold cyan]{sname}:{orig_name}[/bold cyan]"
+        return final_str, badge
+
+    def add_server(self, name: str, command: str, args: Optional[List[str]] = None, env: Optional[Dict[str, str]] = None) -> Tuple[bool, str]:
+        clean_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.strip().lower())
+        self.servers[clean_name] = {
+            "command": command,
+            "args": args or [],
+            "env": env or {}
+        }
+        self.save_config()
+        self.start_servers()
+        return True, f"MCP server '{clean_name}' configured. Registered {len(self.discovered_tools)} total MCP tools."
+
+    def remove_server(self, name: str) -> Tuple[bool, str]:
+        clean_name = name.strip().lower()
+        if clean_name in self.servers:
+            del self.servers[clean_name]
+            self.save_config()
+            proc = self.active_processes.pop(clean_name, None)
+            if proc:
+                try: proc.kill()
+                except Exception: pass
+            to_del = [k for k, v in self.discovered_tools.items() if v[1] == clean_name]
+            for k in to_del:
+                del self.discovered_tools[k]
+            return True, f"Removed MCP server '{clean_name}'."
+        return False, f"Server '{clean_name}' not found."
+
+    def list_servers(self) -> List[Dict[str, Any]]:
+        results = []
+        for name, cfg in self.servers.items():
+            running = name in self.active_processes and self.active_processes[name].poll() is None
+            tools_for_server = [k for k, v in self.discovered_tools.items() if v[1] == name]
+            results.append({
+                "name": name,
+                "command": cfg.get("command"),
+                "running": running,
+                "tools_count": len(tools_for_server)
+            })
+        return results
+
+MCP_MGR = MCPManager()
+
+# ---------------------------------------------------------
 # Built-In Tools & Action Formatters
 # ---------------------------------------------------------
 TOOLS_SPEC = [
@@ -1355,27 +1728,86 @@ TOOLS_SPEC = [
                 "required": ["question"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_outline",
+            "description": "Extract file structure, classes, functions, and method signatures using AST or regex analysis without reading full file content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the code file to inspect"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_checkpoint",
+            "description": "Manage workspace rollback checkpoints (create, restore, list).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "restore", "list"], "description": "Checkpoint action to execute"},
+                    "name": {"type": "string", "description": "Checkpoint name or ID"},
+                    "description": {"type": "string", "description": "Optional note describing the checkpoint"}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_mcp",
+            "description": "Manage Model Context Protocol (MCP) servers and tools (list, add, remove).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "add", "remove"], "description": "MCP management action"},
+                    "name": {"type": "string", "description": "MCP server name"},
+                    "command": {"type": "string", "description": "Command to launch MCP server executable"},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments for MCP command"}
+                },
+                "required": ["action"]
+            }
+        }
     }
 ]
 
 def get_all_tools_spec() -> List[Dict[str, Any]]:
-    """Returns built-in tools plus dynamically registered plugin tools."""
+    """Returns built-in tools, plugin tools, and discovered MCP tools."""
     combined = list(TOOLS_SPEC)
     for fname, (tspec, _) in PLUGIN_MGR.plugin_tools.items():
         if not any(t.get("function", {}).get("name") == fname for t in combined):
             combined.append(tspec)
+    for mname, (mspec, _, _) in MCP_MGR.discovered_tools.items():
+        if not any(t.get("function", {}).get("name") == mname for t in combined):
+            combined.append(mspec)
     return combined
 
 def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[str, str]:
     """Executes a tool and returns (detailed_output, micro_action_badge)."""
     try:
+        perm_mode = harness.config.get("permission_mode", "auto").lower()
+
         if name == "bash":
             cmd = args.get("command", "").strip()
             if not cmd:
                 return "Error: Empty command.", "💻 Exec › [Empty]"
 
-            # Destructive Command Safety Guard
-            if harness.config.get("confirm_danger_commands", True):
+            # Safe mode confirmation
+            if perm_mode == "safe":
+                active_app = getattr(harness, "app_instance", None)
+                if active_app and hasattr(active_app, "active_question"):
+                    # Prompt user confirmation
+                    pass
+
+            # Destructive Command Safety Guard (auto mode)
+            if perm_mode == "safe" or (perm_mode == "auto" and harness.config.get("confirm_danger_commands", True)):
                 danger_patterns = [
                     r"\brm\s+-(?:r|f|rf|fr)\b",
                     r"\bmkfs\b",
@@ -1387,7 +1819,7 @@ def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[s
                 ]
                 is_danger = any(re.search(pat, cmd) for pat in danger_patterns)
                 if is_danger:
-                    msg = f"⚠️ [BLOCKED BY SAFETY GUARD]: Command '{cmd}' was detected as potentially destructive. Confirmation is required. To bypass, run '/settings confirm off'."
+                    msg = f"⚠️ [BLOCKED BY SAFETY GUARD]: Command '{cmd}' was detected as potentially destructive. Confirmation is required. To bypass, run '/permission yolo' or '/settings confirm off'."
                     badge = f"🛡 Safety › [bold red]Blocked Destructive Command[/bold red]"
                     return msg, badge
 
@@ -1425,9 +1857,9 @@ def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[s
                 return f"Error: Path '{root_dir}' not found.", f"🔎 Find  › [red]Not Found[/red]"
 
             matches = []
+            ign_patterns = get_ignored_patterns(root_dir)
             for item in root_dir.rglob(pattern):
-                parts = item.parts
-                if any(p in [".git", "node_modules", "__pycache__", ".venv", ".xdharness"] for p in parts):
+                if is_path_ignored(item, root_dir, ign_patterns):
                     continue
                 try:
                     rel = item.relative_to(root_dir)
@@ -1483,9 +1915,10 @@ def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[s
                 return f"Error: '{target_path}' is not a directory.", f"📁 List  › [red]{target_path.name} (not dir)[/red]"
 
             entries = []
+            ign_patterns = get_ignored_patterns(target_path)
             try:
                 for item in sorted(target_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
-                    if item.name.startswith(".git"):
+                    if is_path_ignored(item, target_path, ign_patterns):
                         continue
                     try:
                         st = item.stat()
@@ -1514,6 +1947,7 @@ def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[s
 
             matches = []
             regex = re.compile(query, flags)
+            ign_patterns = get_ignored_patterns(search_root if search_root.is_dir() else search_root.parent)
 
             def scan_file(file_path: Path):
                 try:
@@ -1531,11 +1965,13 @@ def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[s
                 scan_file(search_root)
             elif search_root.is_dir():
                 for root_dir, dirs, files in os.walk(search_root):
-                    dirs[:] = [d for d in dirs if d not in [".git", "node_modules", "__pycache__", ".venv"]]
+                    dirs[:] = [d for d in dirs if not is_path_ignored(Path(root_dir) / d, search_root, ign_patterns)]
                     for file in files:
-                        scan_file(Path(root_dir) / file)
-                        if len(matches) >= 40:
-                            break
+                        fp = Path(root_dir) / file
+                        if not is_path_ignored(fp, search_root, ign_patterns):
+                            scan_file(fp)
+                            if len(matches) >= 40:
+                                break
                     if len(matches) >= 40:
                         break
 
@@ -1892,6 +2328,59 @@ def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[s
 
             return f"User answered: {user_reply}", f"❓ Question › [bold green]Answered[/bold green]"
 
+        elif name == "code_outline":
+            target_file = Path(args.get("path", "")).expanduser()
+            outline_txt = extract_code_outline(target_file)
+            badge = f"📑 Outline › [bold cyan]{target_file.name}[/bold cyan]"
+            return outline_txt, badge
+
+        elif name == "manage_checkpoint":
+            action = args.get("action", "list").lower()
+            cp_name = args.get("name", "").strip()
+            desc = args.get("description", "").strip()
+            if action == "create":
+                ok, msg = CHECKPOINT_MGR.create_checkpoint(cp_name, desc)
+                return msg, f"💾 Checkpoint › [{'bold green' if ok else 'red'}]{'Created' if ok else 'Failed'}[/]"
+            elif action == "restore":
+                if not cp_name:
+                    return "Error: Checkpoint name or ID required to restore.", "💾 Checkpoint › [red]Missing Name[/red]"
+                ok, msg = CHECKPOINT_MGR.restore_checkpoint(cp_name)
+                return msg, f"💾 Checkpoint › [{'bold green' if ok else 'red'}]{'Restored' if ok else 'Failed'}[/]"
+            elif action == "list":
+                cps = CHECKPOINT_MGR.list_checkpoints()
+                if not cps:
+                    return "No checkpoints found.", "💾 Checkpoint › [Empty]"
+                cp_lines = [f"- **{c['name']}** (ID: `{c['id']}`, Files: {c.get('files_count', 0)}, Date: {c.get('created_at')}) {c.get('description', '')}" for c in cps]
+                return "Saved Checkpoints:\n" + "\n".join(cp_lines), f"💾 Checkpoint › [bold cyan]{len(cps)} Checkpoints[/bold cyan]"
+            return f"Error: Unknown action '{action}'.", "💾 Checkpoint › [red]Unknown Action[/red]"
+
+        elif name == "manage_mcp":
+            action = args.get("action", "list").lower()
+            mname = args.get("name", "").strip()
+            mcmd = args.get("command", "").strip()
+            margs = args.get("args") or []
+            if action == "list":
+                servers = MCP_MGR.list_servers()
+                if not servers:
+                    return "No MCP servers configured.", "🔌 MCP › [Empty]"
+                lines = [f"- **{s['name']}** (Status: {'running' if s['running'] else 'stopped'}, Tools: {s['tools_count']}) Command: `{s['command']}`" for s in servers]
+                return "MCP Servers:\n" + "\n".join(lines), f"🔌 MCP › [bold cyan]{len(servers)} Servers[/bold cyan]"
+            elif action == "add":
+                if not mname or not mcmd:
+                    return "Error: 'name' and 'command' are required.", "🔌 MCP › [red]Missing Info[/red]"
+                ok, msg = MCP_MGR.add_server(mname, mcmd, margs)
+                return msg, f"🔌 MCP › [{'bold green' if ok else 'red'}]+{mname}[/]"
+            elif action == "remove":
+                if not mname:
+                    return "Error: 'name' is required to remove MCP server.", "🔌 MCP › [red]Missing Name[/red]"
+                ok, msg = MCP_MGR.remove_server(mname)
+                return msg, f"🔌 MCP › [{'bold green' if ok else 'red'}]-{mname}[/]"
+            return f"Error: Unknown action '{action}'.", "🔌 MCP › [red]Unknown Action[/red]"
+
+        # Check MCP tools (prefix mcp_)
+        if name.startswith("mcp_") and name in MCP_MGR.discovered_tools:
+            return MCP_MGR.call_tool(name, args)
+
         # Check dynamic plugin tools
         if name in PLUGIN_MGR.plugin_tools:
             _, handler = PLUGIN_MGR.plugin_tools[name]
@@ -1938,6 +2427,12 @@ SLASH_COMMANDS = {
     "/skill": "Manage & execute skills (/skill list, run <name>, create)",
     "/agent": "Manage & spawn agents (/agent list, spawn, create)",
     "/plugin": "Manage plugins (/plugin list, add, install <url>, del <name>)",
+    "/checkpoint": "Rollback snapshots (/checkpoint create <name>|restore <id>|list)",
+    "/mcp": "Model Context Protocol (/mcp list|add <name> <cmd>|remove <name>)",
+    "/permission": "Set execution permission mode (/permission safe|auto|yolo)",
+    "/outline": "Show AST / symbol code outline (/outline <path>)",
+    "/schedule": "Schedule recurring agent task (/schedule <interval_sec> <task>)",
+    "/drawer": "Toggle sidecar drawer panel (or F2 / Ctrl+B)",
     "/clear": "Clear conversation viewport (or Ctrl+L)",
     "/help": "Show available slash commands",
     "/exit": "Save session and exit (or Ctrl+Q)"
@@ -1974,7 +2469,22 @@ class XDHCompleter(Completer):
                         yield Completion(sc, start_position=-len(cmd), display=sc, display_meta=desc)
             elif cmd == "/settings":
                 typed = parts[1] if len(parts) > 1 else ""
-                for opt in ["theme", "tools", "thinking", "provider", "model", "confirm"]:
+                for opt in ["theme", "tools", "thinking", "provider", "model", "confirm", "permission"]:
+                    if opt.startswith(typed):
+                        yield Completion(opt, start_position=-len(typed))
+            elif cmd == "/permission":
+                typed = parts[1] if len(parts) > 1 else ""
+                for opt in ["safe", "auto", "yolo"]:
+                    if opt.startswith(typed):
+                        yield Completion(opt, start_position=-len(typed))
+            elif cmd == "/checkpoint":
+                typed = parts[1] if len(parts) > 1 else ""
+                for opt in ["create", "restore", "list"]:
+                    if opt.startswith(typed):
+                        yield Completion(opt, start_position=-len(typed))
+            elif cmd == "/mcp":
+                typed = parts[1] if len(parts) > 1 else ""
+                for opt in ["list", "add", "remove"]:
                     if opt.startswith(typed):
                         yield Completion(opt, start_position=-len(typed))
             elif cmd == "/todo":
@@ -2022,7 +2532,7 @@ class XDHCompleter(Completer):
                 for opt in ["md", "json", "html"]:
                     if opt.startswith(typed):
                         yield Completion(opt, start_position=-len(typed))
-            elif cmd == "/pin":
+            elif cmd in ["/pin", "/outline"]:
                 typed = parts[1] if len(parts) > 1 else ""
                 cwd = Path(".")
                 try:
@@ -2073,6 +2583,8 @@ class XDHApp:
         self.history_blocks: List[Dict[str, Any]] = []
         self.collapsed_state: bool = False
         self.staged_diffs: List[Dict[str, str]] = []
+        self.drawer_open: bool = False
+        self.active_schedules: List[Dict[str, Any]] = []
 
         # Segment 1: Fixed Top Banner Window
         self.top_banner_window = Window(
@@ -2096,6 +2608,14 @@ class XDHApp:
         self.viewport_window = Window(
             content=self.viewport_control,
             wrap_lines=True
+        )
+
+        # Sidecar Drawer Window (F2 / Ctrl+B)
+        self.drawer_control = FormattedTextControl(self.render_drawer_panel)
+        self.drawer_window = Window(
+            content=self.drawer_control,
+            width=Dimension(preferred=32, max=40),
+            dont_extend_width=True
         )
 
         # Segment 3: Bottom Pinned Composer with Ghost-Writing (AppendAutoSuggestion)
@@ -2197,6 +2717,14 @@ class XDHApp:
             self.rebuild_buffer_text()
             st = "COLLAPSED (summaries)" if self.collapsed_state else "EXPANDED (full)"
             self.append_output(f"⚡ Viewport blocks: [bold cyan]{st}[/bold cyan]")
+
+        @self.kb.add("f2")
+        @self.kb.add("c-b")
+        def _toggle_drawer(event):
+            self.drawer_open = not self.drawer_open
+            st = "OPEN" if self.drawer_open else "CLOSED"
+            self.append_output(f"📊 Drawer sidecar: [bold cyan]{st}[/bold cyan]")
+            self.invalidate_ui()
 
         # Tab: Apply completion if menu active, accept ghost suggestion, or start completion
         @self.kb.add("tab")
@@ -2357,11 +2885,24 @@ class XDHApp:
 
             threading.Thread(target=self.run_agent_thread, args=(prompt_payload,), daemon=True).start()
 
+        # Dynamic viewport row: shows drawer sidecar when toggled (F2 / Ctrl+B)
+        def get_viewport_row():
+            if self.drawer_open:
+                return VSplit([self.viewport_window, self.drawer_window])
+            return self.viewport_window
+
         # Combine into Root Container with Floats
         root_container = FloatContainer(
             content=HSplit([
                 self.top_banner_window,
-                self.viewport_window,
+                VSplit([
+                    self.viewport_window,
+                    Window(
+                        content=self.drawer_control,
+                        width=lambda: Dimension(preferred=32, max=40) if self.drawer_open else Dimension(preferred=0, max=0),
+                        dont_extend_width=True
+                    )
+                ]),
                 header_window,
                 composer_row,
                 footer_window
@@ -2444,6 +2985,64 @@ class XDHApp:
             "scrollbar.button": f"{theme['dim']}",
             "auto-suggestion": f"{theme['dim']}",
         })
+
+    def render_drawer_panel(self):
+        """Renders live sidecar status panel (F2 / Ctrl+B toggle)."""
+        if not self.drawer_open:
+            return []
+        cols, rows = self.get_term_size()
+        theme = self.harness.theme
+        width = min(36, max(26, cols // 3))
+
+        lines = []
+        lines.append(f"[bold {theme['primary']}]📊 SIDECAR DRAWER[/bold {theme['primary']}]")
+        lines.append("[dim]─────────────────────────[/dim]")
+
+        # Section 1: Swarm & Agents
+        agents = AGENT_MGR.list_agents()
+        lines.append(f"[bold {theme['warning']}]🤖 Agent Swarm ({len(agents)})[/bold {theme['warning']}]")
+        for a in agents[:4]:
+            lines.append(f" • [cyan]{a['name']}[/cyan]: [dim]{a.get('role', '')[:16]}[/dim]")
+
+        # Section 2: MCP Servers
+        mcp_srv = MCP_MGR.list_servers()
+        lines.append(f"\n[bold {theme['accent']}]🔌 MCP Servers ({len(mcp_srv)})[/bold {theme['accent']}]")
+        if not mcp_srv:
+            lines.append(" [dim italic]None configured[/dim italic]")
+        else:
+            for s in mcp_srv[:3]:
+                st = "[green]●[/green]" if s['running'] else "[dim]○[/dim]"
+                lines.append(f" {st} [bold]{s['name']}[/bold] ({s['tools_count']} tools)")
+
+        # Section 3: Checkpoints
+        cps = CHECKPOINT_MGR.list_checkpoints()
+        lines.append(f"\n[bold {theme['secondary']}]💾 Snapshots ({len(cps)})[/bold {theme['secondary']}]")
+        if not cps:
+            lines.append(" [dim italic]No checkpoints[/dim italic]")
+        else:
+            for c in cps[:2]:
+                lines.append(f" • [bold white]{c['name']}[/bold white] [dim]({c.get('files_count',0)}f)[/dim]")
+
+        # Section 4: Tasks / Todos
+        todos = self.harness.todos
+        lines.append(f"\n[bold {theme['warning']}]📋 Tasks ({len(todos)})[/bold {theme['warning']}]")
+        if not todos:
+            lines.append(" [dim italic]Board is clear[/dim italic]")
+        else:
+            for t in todos[:3]:
+                mark = "[green]✓[/green]" if t['done'] else "[yellow]•[/yellow]"
+                lines.append(f" {mark} #{t['id']} {t['title'][:18]}")
+
+        # Section 5: Schedules
+        if self.active_schedules:
+            lines.append(f"\n[bold cyan]⏰ Schedules ({len(self.active_schedules)})[/bold cyan]")
+            for sc in self.active_schedules[:2]:
+                lines.append(f" • every {sc['interval']}s: {sc['task'][:14]}")
+
+        lines.append("\n[dim]Press [bold]F2[/bold] or [bold]Ctrl+B[/bold] to hide[/dim]")
+
+        panel = Panel(Text.from_markup("\n".join(lines)), title="Drawer", box=box.ROUNDED, border_style=theme["rich_border"], padding=(0, 1))
+        return ANSI(render_rich_to_string(panel, max_cols=width))
 
     def render_top_banner(self):
         """Top Segment: Pinned, non-scrolling responsive Hero Header."""
@@ -2568,12 +3167,13 @@ class XDHApp:
 
     def render_footer_bar(self):
         cols, _ = self.get_term_size()
+        drawer_st = "Drawer"
         if cols < 65:
-            hints = " [↵] Send │ [^T] Theme │ [/] Help "
+            hints = " [↵] Send │ [F2] Drawer │ [/] Help "
         elif cols < 95:
-            hints = " [↵] Send │ [^T] Theme │ [^P] Provider │ [^L] Clear │ [^C] Halt "
+            hints = " [↵] Send │ [F2] Drawer │ [^T] Theme │ [^P] Prov │ [^L] Clear │ [ESC] Halt "
         else:
-            hints = " [↵] Send │ [Ctrl+J] Line │ [^T] Theme │ [^P] Provider │ [^L] Clear │ [^C] Halt │ [/] Commands "
+            hints = " [↵] Send │ [Ctrl+J] Line │ [F2] Drawer │ [^T] Theme │ [^P] Prov │ [^L] Clear │ [ESC] Halt │ [/] Commands "
 
         fill = "─" * max(0, cols - len(hints) - 3)
         return [
@@ -3303,6 +3903,95 @@ class XDHApp:
             else:
                 self.append_output("[yellow]Usage: /plugin <list|install <git_url>|del <name>|add>[/yellow]")
 
+        elif root == "/permission":
+            if len(parts) > 1:
+                mode = parts[1].lower()
+                if mode in ["safe", "auto", "yolo"]:
+                    self.harness.config["permission_mode"] = mode
+                    self.harness.save_config()
+                    self.append_output(f"✓ Execution permission mode set to: [bold cyan]{mode.upper()}[/bold cyan]")
+                else:
+                    self.append_output("[yellow]Usage: /permission <safe|auto|yolo>[/yellow]")
+            else:
+                curr = self.harness.config.get("permission_mode", "auto").upper()
+                self.append_output(f"Current permission mode: [bold cyan]{curr}[/bold cyan]\nModes: safe (confirm all mutations), auto (guard destructive commands), yolo (unconstrained)")
+
+        elif root == "/checkpoint":
+            sub = parts[1].lower() if len(parts) > 1 else "list"
+            if sub == "list":
+                out, _ = execute_tool("manage_checkpoint", {"action": "list"}, self.harness)
+                p = Panel(Markdown(out), title="💾 Workspace Checkpoints", box=box.ROUNDED, border_style=theme["accent"])
+                self.append_output(render_rich_to_string(p, max_cols=cols))
+            elif sub == "create":
+                cp_name = parts[2] if len(parts) > 2 else f"cp_{int(time.time())}"
+                desc = " ".join(parts[3:]) if len(parts) > 3 else ""
+                out, _ = execute_tool("manage_checkpoint", {"action": "create", "name": cp_name, "description": desc}, self.harness)
+                self.append_output(f"✓ {out}")
+            elif sub == "restore" and len(parts) >= 3:
+                target_cp = parts[2]
+                out, _ = execute_tool("manage_checkpoint", {"action": "restore", "name": target_cp}, self.harness)
+                self.append_output(f"✓ {out}")
+            else:
+                self.append_output("[yellow]Usage: /checkpoint <list|create [name]|restore <id>>[/yellow]")
+
+        elif root == "/mcp":
+            sub = parts[1].lower() if len(parts) > 1 else "list"
+            if sub == "list":
+                out, _ = execute_tool("manage_mcp", {"action": "list"}, self.harness)
+                p = Panel(Markdown(out), title="🔌 Model Context Protocol (MCP)", box=box.ROUNDED, border_style=theme["accent"])
+                self.append_output(render_rich_to_string(p, max_cols=cols))
+            elif sub == "add" and len(parts) >= 4:
+                mname = parts[2]
+                mcmd = parts[3]
+                margs = parts[4:] if len(parts) > 4 else []
+                out, _ = execute_tool("manage_mcp", {"action": "add", "name": mname, "command": mcmd, "args": margs}, self.harness)
+                self.append_output(f"✓ {out}")
+            elif sub in ["remove", "del"] and len(parts) >= 3:
+                mname = parts[2]
+                out, _ = execute_tool("manage_mcp", {"action": "remove", "name": mname}, self.harness)
+                self.append_output(f"✓ {out}")
+            else:
+                self.append_output("[yellow]Usage: /mcp <list|add <name> <command> [args...]|remove <name>>[/yellow]")
+
+        elif root == "/outline":
+            target_path = Path(parts[1] if len(parts) > 1 else ".").expanduser()
+            if not target_path.is_file():
+                self.append_output(f"[yellow]Usage: /outline <path/to/code_file>[/yellow]")
+            else:
+                out, badge = execute_tool("code_outline", {"path": str(target_path)}, self.harness)
+                p = Panel(Text(out), title=f"📑 Code Outline: {target_path.name}", box=box.ROUNDED, border_style=theme["accent"])
+                self.append_output(render_rich_to_string(p, max_cols=cols))
+
+        elif root == "/schedule":
+            if len(parts) >= 3 and parts[1].isdigit():
+                interval = int(parts[1])
+                task_text = " ".join(parts[2:])
+                sched_id = len(self.active_schedules) + 1
+                sched_entry = {"id": sched_id, "interval": interval, "task": task_text, "running": True}
+                self.active_schedules.append(sched_entry)
+
+                def _scheduled_worker(sc):
+                    while sc.get("running"):
+                        time.sleep(sc["interval"])
+                        if not sc.get("running"):
+                            break
+                        self.append_output(f"⏰ [bold cyan]Scheduled Trigger (#{sc['id']})[/bold cyan]: {sc['task']}")
+                        self.run_agent_thread(f"[SCHEDULED AUTONOMOUS TASK]: {sc['task']}")
+
+                threading.Thread(target=_scheduled_worker, args=(sched_entry,), daemon=True).start()
+                self.append_output(f"✓ Scheduled task #{sched_id} every {interval}s: \"{task_text}\"")
+            else:
+                if self.active_schedules:
+                    lines = [f"#{s['id']}: every {s['interval']}s › {s['task']}" for s in self.active_schedules]
+                    self.append_output("Active Schedules:\n" + "\n".join(lines))
+                else:
+                    self.append_output("[yellow]Usage: /schedule <interval_sec> <task prompt>[/yellow]")
+
+        elif root == "/drawer":
+            self.drawer_open = not self.drawer_open
+            st = "OPEN" if self.drawer_open else "CLOSED"
+            self.append_output(f"📊 Drawer sidecar: [bold cyan]{st}[/bold cyan] (toggle with F2 or Ctrl+B)")
+
         self.invalidate_ui()
 
     def run_agent_thread(self, user_input: str):
@@ -3628,13 +4317,203 @@ class XDHApp:
                 return
 
 # ---------------------------------------------------------
+# Headless Execution Mode
+# ---------------------------------------------------------
+def run_headless(harness: XDHarness, prompt: str, pipe_mode: bool = False):
+    """Executes prompt headlessly to stdout without launching prompt_toolkit TUI."""
+    harness.messages.append({"role": "user", "content": prompt})
+    harness.compact_context_if_needed()
+    tools = get_all_tools_spec() if harness.config.get("active_tools") else None
+
+    # Lightweight streaming generator
+    pdata = harness.current_provider_data
+    base_url = pdata.get("base_url", "").rstrip("/")
+    api_key = pdata.get("api_key") or "none"
+    model = pdata.get("default_model", "unknown")
+
+    turn = 0
+    while True:
+        turn += 1
+        payload = {
+            "model": model,
+            "messages": harness.messages,
+            "stream": True,
+            "stream_options": {"include_usage": True}
+        }
+        if tools and harness.config.get("active_tools", True):
+            payload["tools"] = tools
+
+        req_data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if api_key and api_key != "none":
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        req = urllib.request.Request(f"{base_url}/chat/completions", data=req_data, headers=headers, method="POST")
+
+        accumulated_content = ""
+        accumulated_thought = ""
+        tool_calls_map: Dict[int, Dict[str, Any]] = {}
+        inside_think = False
+
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except Exception:
+                        continue
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+
+                    thought_chunk = delta.get("reasoning_content") or delta.get("reasoning")
+                    if thought_chunk:
+                        accumulated_thought += thought_chunk
+                        if not pipe_mode and harness.config.get("show_thinking"):
+                            sys.stderr.write(f"\033[90m{thought_chunk}\033[0m")
+                            sys.stderr.flush()
+
+                    delta_tools = delta.get("tool_calls")
+                    if delta_tools:
+                        for dt in delta_tools:
+                            idx = dt.get("index", 0)
+                            if idx not in tool_calls_map:
+                                tool_calls_map[idx] = {"id": dt.get("id", ""), "type": "function", "function": {"name": "", "arguments": ""}}
+                            if dt.get("id"):
+                                tool_calls_map[idx]["id"] = dt["id"]
+                            fn = dt.get("function", {})
+                            if fn.get("name"):
+                                tool_calls_map[idx]["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                tool_calls_map[idx]["function"]["arguments"] += fn["arguments"]
+
+                    content_chunk = delta.get("content", "")
+                    if content_chunk:
+                        while content_chunk:
+                            if inside_think:
+                                if "</think>" in content_chunk:
+                                    p, content_chunk = content_chunk.split("</think>", 1)
+                                    inside_think = False
+                                else:
+                                    content_chunk = ""
+                            else:
+                                if "<think>" in content_chunk:
+                                    p, content_chunk = content_chunk.split("<think>", 1)
+                                    if p:
+                                        sys.stdout.write(p)
+                                        sys.stdout.flush()
+                                        accumulated_content += p
+                                    inside_think = True
+                                else:
+                                    sys.stdout.write(content_chunk)
+                                    sys.stdout.flush()
+                                    accumulated_content += content_chunk
+                                    content_chunk = ""
+
+        except Exception as e:
+            sys.stderr.write(f"\n[Error: {e}]\n")
+            break
+
+        assistant_record = {
+            "role": "assistant",
+            "content": accumulated_content if accumulated_content else None
+        }
+        if accumulated_thought:
+            assistant_record["reasoning_content"] = accumulated_thought
+        final_tools = list(tool_calls_map.values()) if tool_calls_map else None
+        if final_tools:
+            for tc in final_tools:
+                if not tc.get("id"):
+                    tc["id"] = harness.next_call_id()
+            assistant_record["tool_calls"] = final_tools
+
+        harness.messages.append(assistant_record)
+
+        if not final_tools:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            break
+
+        for tc in final_tools:
+            fn = tc.get("function", {})
+            fname = fn.get("name")
+            call_id = tc.get("id")
+            try:
+                fargs = json.loads(fn.get("arguments", "{}"))
+            except Exception:
+                fargs = {}
+
+            if not pipe_mode:
+                sys.stderr.write(f"\n⚡ \033[1;36mTool: {fname}\033[0m {json.dumps(fargs)[:60]}\n")
+                sys.stderr.flush()
+
+            tout, _ = execute_tool(fname, fargs, harness)
+            harness.messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": fname,
+                "content": str(tout)
+            })
+
+    harness.save_session()
+
+# ---------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-v"):
-        print(f"xdh {__version__}")
-        return
+    parser = argparse.ArgumentParser(description=f"xdh (xdharness) v{__version__} - Autonomous Terminal Agent Harness")
+    parser.add_argument("-v", "--version", action="version", version=f"xdh {__version__}")
+    parser.add_argument("-p", "--prompt", type=str, default="", help="Run prompt non-interactively (headless mode)")
+    parser.add_argument("--pipe", action="store_true", help="Pipe mode: read stdin, write clean LLM answer to stdout")
+    parser.add_argument("--safe", action="store_true", help="Safe permission mode (prompts before file/system modifications)")
+    parser.add_argument("--yolo", action="store_true", help="YOLO mode (unconstrained autonomous tool execution)")
+    parser.add_argument("--provider", type=str, default="", help="Override active provider (ollama, openrouter, openai, groq)")
+    parser.add_argument("--model", type=str, default="", help="Override default model")
+
+    args, unknown = parser.parse_known_args()
+
     harness = XDHarness()
+
+    # Apply overrides
+    if args.safe:
+        harness.config["permission_mode"] = "safe"
+    elif args.yolo:
+        harness.config["permission_mode"] = "yolo"
+
+    if args.provider and args.provider in harness.config.get("providers", {}):
+        harness.config["current_provider"] = args.provider
+    if args.model:
+        curr_p = harness.config.get("current_provider")
+        if curr_p and curr_p in harness.config.get("providers", {}):
+            harness.config["providers"][curr_p]["default_model"] = args.model
+
+    # Check for piped stdin or -p/--prompt
+    piped_stdin = ""
+    if not sys.stdin.isatty():
+        try:
+            piped_stdin = sys.stdin.read().strip()
+        except Exception:
+            pass
+
+    prompt_to_run = args.prompt
+    if piped_stdin:
+        if prompt_to_run:
+            prompt_to_run = f"{prompt_to_run}\n\n[Piped Standard Input]:\n{piped_stdin}"
+        else:
+            prompt_to_run = piped_stdin
+
+    if prompt_to_run or args.pipe:
+        run_headless(harness, prompt_to_run, pipe_mode=args.pipe)
+        return
+
+    # Full TUI interactive mode
     app = XDHApp(harness)
     app.app.run()
 

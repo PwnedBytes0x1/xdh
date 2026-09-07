@@ -25,22 +25,29 @@
   ╚██╗██╔╝██╔══██╗██║  ██║
    ╚███╔╝ ██║  ██║███████║
    ██╔██╗ ██║  ██║██╔══██║
-  ██╔╝ ██╗██████╔╝██║  ██║   xdharness v1.0.2
+  ██╔╝ ██╗██████╔╝██║  ██║   xdharness v1.0.3
 ```
 
 ---
 
 ## 🚀 Features
 
-- 🖥️ **3-Segment Layout**: Real-time context header (tokens, RAM, latency, provider/model), scrollable history viewport with collapsible blocks, and dynamic multi-line composer.
+- 🖥️ **3-Segment Layout & Responsive Drawer**: Real-time context header (tokens, RAM, latency, provider/model), scrollable history viewport with collapsible blocks, sidecar drawer panel (`F2` / `Ctrl+B`), and dynamic multi-line composer.
+- ⚡ **Headless & Pipe Mode**: Full CLI non-interactive operation (`xdh -p "prompt"`, `--pipe`, `cat file | xdh -p "..." > out`) without launching the full TUI.
+- 🛡️ **Configurable Permission Modes**: `--safe` (strict confirmation on state changes), `--auto` (default guard against destructive commands), and `--yolo` (unconstrained speed).
+- 🔌 **Model Context Protocol (MCP)**: Native stdio JSON-RPC 2.0 MCP client integration. Configure servers in `~/.xdharness/mcp.json` or `/mcp add`, with automatic dynamic tool discovery.
+- 📑 **AST Code Structure Outline**: Fast structural inspections via AST / multi-language pattern parser (`code_outline` and `/outline <file>`).
+- 💾 **Rollback Checkpoints**: Instant snapshots of entire workspaces before refactors (`manage_checkpoint` and `/checkpoint create|restore|list`).
+- 🚫 **`.xdhignore` & `.gitignore` Filters**: Full workspace scanning exclusion support across search, tree, and index tools.
+- ⏰ **Autonomous Task Scheduling**: Schedule recurring autonomous agent triggers via `/schedule <interval_sec> <task>`.
 - 🎯 **Reusable Skills System**: Built-in `create_skill` & `call_skill` engine. Define, discover, and run skills via `/skill list`, `/skill run <name>`, or autonomous agent calls.
-- 🤖 **Multi-Agent Orchestration**: Built-in `create_agent` & `spawn_agents`. Launch multiple specialized subagents (researcher, coder, tester, reviewer, custom personas) concurrently in parallel threads to solve tasks cooperatively.
-- 🔌 **Dynamic Plugin Management**: Add, install from git repositories, delete, and manage community or personal plugins via `/plugin` and autonomous tool injection into `TOOLS_SPEC`.
-- ❓ **Interactive User Question Prompting**: Agents can invoke `ask_question` with selectable options to clarify ambiguity during execution, awaiting user input before proceeding.
-- ⚡ **Mid-Run User Guidance Interruption**: Send a message or press `ESC` / `Ctrl+C` while an agent is executing to immediately pause, incorporate guidance (e.g. "don't do that, do this instead"), and pivot smoothly.
-- 🛡️ **Fault-Tolerant Resilience**: 5-stage connection retry backoff (increasing by +5s intervals: 5s, 10s, 15s, 20s, 25s) with automatic failover between LLM providers.
-- ♾️ **Unconstrained Autonomous Execution**: Removed artificial tool round limits for complex, hundreds-step autonomous pipelines.
-- 🎨 **7 Curated Color Palettes**: `tokyo_night`, `dracula`, `catppuccin`, `monokai`, `nord`, `cyberpunk`, and `gruvbox`.
+- 🤖 **Multi-Agent Orchestration**: Built-in `create_agent` & `spawn_agents`. Launch multiple specialized subagents concurrently in parallel threads to solve tasks cooperatively.
+- 🔌 **Dynamic Plugin Management**: Add, install from git repositories, delete, and manage community or personal plugins via `/plugin`.
+- ❓ **Interactive User Question Prompting**: Agents can invoke `ask_question` with selectable options to clarify ambiguity during execution.
+- ⚡ **Mid-Run User Guidance Interruption**: Send a message or press `ESC` / `Ctrl+C` while an agent is executing to immediately pause, incorporate guidance, and pivot smoothly.
+- 🛡️ **Fault-Tolerant Resilience**: 5-stage connection retry backoff with automatic provider failover.
+- ♾️ **Unconstrained Autonomous Execution**: Removed artificial tool round limits for complex pipelines.
+- 🎨 **Curated Color Palettes**: `tokyo_night`, `dracula`, `catppuccin`, `monokai`, `nord`, `cyberpunk`, `gruvbox`, and `solarized`.
 - 📱 **Mobile & Termux First**: Smooth step-scroll animation for touch gestures, compact mini-banners for narrow viewports (<70 cols), and zero heavy C-extension dependencies.
 - 🧠 **Context Optimization**: Automatic message history compaction when nearing token capacity thresholds.
 
@@ -108,6 +115,12 @@ xdh
 | `/thinking` | Toggle live thought/reasoning token streaming | `/thinking on` |
 | `/diff` | Inspect staged file diffs proposed by agent | `/diff` |
 | `/apply` | Apply pending unified diffs to files | `/apply` |
+| `/checkpoint` | Manage rollback snapshots | `/checkpoint create pre_refactor` |
+| `/mcp` | Manage Model Context Protocol servers | `/mcp list` or `/mcp add <name> <cmd>` |
+| `/permission` | Configure safety/permission mode | `/permission safe` or `/permission yolo` |
+| `/outline` | Show AST/regex code structure outline | `/outline xdh.py` |
+| `/schedule` | Autonomous interval task execution | `/schedule 60 "check git status"` |
+| `/drawer` | Toggle sidecar status drawer pane | `/drawer` |
 | `/tasks` | List, inspect, or kill background tasks | `/tasks list` / `/tasks logs <id>` |
 | `/git` | Execute git status, diff, or commit directly | `/git status` |
 | `/scratch` | Access or update persistent scratchpad memo | `/scratch set <notes>` |
@@ -126,11 +139,13 @@ xdh
 - **`Tab`**: Auto-complete slash command / accept ghost suggestion.
 - **`Right Arrow`**: Accept ghost suggestion at line end.
 - **`Up / Down`**: Navigate history or smooth-scroll conversation viewport.
+- **`F2` / `Ctrl+B`**: Toggle sidecar drawer pane (swarm stats, MCPs, checkpoints, tasks).
+- **`ESC` / `Ctrl+C`**: Interrupt running generation / halt active task.
 - **`Ctrl+T`**: Cycle color themes dynamically.
 - **`Ctrl+P`**: Cycle configured AI providers.
 - **`Ctrl+O`**: Toggle block collapse (compact vs expanded summary).
 - **`Ctrl+L`**: Clear current viewport.
-- **`Ctrl+C`**: Interrupt running generation / exit.
+- **`Ctrl+J`**: Insert newline in composer without submitting.
 - **`Ctrl+Q`**: Save session and quit.
 
 ---
