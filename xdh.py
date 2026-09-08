@@ -40,6 +40,7 @@ from rich.table import Table
 from rich.markdown import Markdown
 from rich.text import Text
 from rich.syntax import Syntax
+from rich.markup import escape
 from rich import box
 
 # Prompt Toolkit imports
@@ -425,7 +426,7 @@ def render_rich_to_string(renderable: Any, max_cols: int = 80) -> str:
     cols = max(20, max_cols)
     console = getattr(_CONSOLE_CACHE, "console", None)
     if console is None or getattr(_CONSOLE_CACHE, "cols", None) != cols:
-        console = Console(width=cols, force_terminal=True, color_system="truecolor", highlight=False)
+        console = Console(width=cols, height=25, force_terminal=True, color_system="truecolor", highlight=False)
         _CONSOLE_CACHE.console = console
         _CONSOLE_CACHE.cols = cols
     with console.capture() as capture:
@@ -2474,7 +2475,7 @@ def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[s
 
         return f"Unknown tool: {name}", f"⚙ Tool  › {name}"
     except Exception as e:
-        return f"Tool Error: {str(e)}", f"⚠️ Error › {name} ({str(e)})"
+        return f"Tool Error: {str(e)}", f"⚠️ Error › {name} ({escape(str(e))})"
 
 # ---------------------------------------------------------
 # Slash Commands Autocompleter
@@ -2518,18 +2519,41 @@ SLASH_COMMANDS = {
     "/exit": "Save session and exit (or Ctrl+Q)"
 }
 
-def clamp_to_lines(text: str, max_lines: int = 5, expand_hint: str = "Ctrl+O to expand") -> Tuple[str, bool]:
-    """Clamps text to max_lines, returning (clamped_text, is_truncated)."""
+def clamp_to_lines(text: str, max_lines: int = 5, screen_width: int = 80, expand_hint: str = "Ctrl+O to expand") -> Tuple[str, bool]:
+    """Clamps text to max_lines of screen height (accounting for wrapping), returning (clamped_text, is_truncated)."""
     if not text:
         return "", False
-    lines = text.splitlines()
-    if len(lines) <= max_lines:
+    raw_lines = text.splitlines()
+    inner_width = max(20, screen_width - 4)
+
+    total_screen_lines = 0
+    for line in raw_lines:
+        line_len = len(line)
+        screen_h = max(1, (line_len + inner_width - 1) // inner_width) if line_len > 0 else 1
+        total_screen_lines += screen_h
+
+    if total_screen_lines <= max_lines:
         return text, False
-    truncated = lines[:max_lines]
-    remaining = len(lines) - max_lines
-    hint = f"… [dim](+{remaining} more lines, {expand_hint})[/dim]"
-    truncated.append(hint)
-    return "\n".join(truncated), True
+
+    accumulated_screen = 0
+    kept_raw = []
+    for line in raw_lines:
+        line_len = len(line)
+        screen_h = max(1, (line_len + inner_width - 1) // inner_width) if line_len > 0 else 1
+        if accumulated_screen + screen_h <= max_lines:
+            kept_raw.append(line)
+            accumulated_screen += screen_h
+        else:
+            remaining_budget = max_lines - accumulated_screen
+            if remaining_budget > 0 and line_len > 0:
+                char_budget = remaining_budget * inner_width
+                kept_raw.append(line[:char_budget])
+            break
+
+    rem = max(1, total_screen_lines - max_lines)
+    hint = f"… [dim](+{rem} more lines, {expand_hint})[/dim]"
+    kept_raw.append(hint)
+    return "\n".join(kept_raw), True
 
 class XDHCompleter(Completer):
     def __init__(self, harness: XDHarness):
@@ -3304,7 +3328,7 @@ class XDHApp:
         try:
             loop = getattr(self.app, "loop", None)
             if loop and loop.is_running():
-                self.app.call_from_executor(self.app.invalidate)
+                loop.call_soon_threadsafe(self.app.invalidate)
             else:
                 self.app.invalidate()
         except Exception:
@@ -3377,9 +3401,33 @@ class XDHApp:
                     padding=(0, 1)
                 )
             else:
-                clamped_thought, _ = clamp_to_lines(thought_text, max_lines=5)
+                raw_lines = thought_text.splitlines()
+                inner_w = max(20, cols - 4)
+                total_screen_lines = sum(max(1, (len(l) + inner_w - 1) // inner_w) if len(l) > 0 else 1 for l in raw_lines)
+                
+                t = Text()
+                if total_screen_lines <= 5:
+                    t.append(thought_text, style=f"dim {theme['warning']}")
+                else:
+                    accumulated_screen = 0
+                    kept_raw = []
+                    for l in raw_lines:
+                        l_len = len(l)
+                        s_h = max(1, (l_len + inner_w - 1) // inner_w) if l_len > 0 else 1
+                        if accumulated_screen + s_h <= 5:
+                            kept_raw.append(l)
+                            accumulated_screen += s_h
+                        else:
+                            rem_budget = 5 - accumulated_screen
+                            if rem_budget > 0 and l_len > 0:
+                                kept_raw.append(l[:rem_budget * inner_w])
+                            break
+                    rem_lines = max(1, total_screen_lines - 5)
+                    t.append(f"… (+{rem_lines} more lines, Ctrl+O to expand)\n", style="dim")
+                    t.append("\n".join(kept_raw), style=f"dim {theme['warning']}")
+
                 panel = Panel(
-                    Text.from_markup(clamped_thought) if "… [dim]" in clamped_thought else Text(clamped_thought, style=f"dim {theme['warning']}"),
+                    t,
                     title=f"⚡ Thinking{time_str}",
                     box=box.ROUNDED,
                     border_style=theme["warning"],
@@ -3389,8 +3437,12 @@ class XDHApp:
 
         elif btype == "tool":
             badge_text = item.get("badge", "")
+            try:
+                badge_content = Text.from_markup(badge_text)
+            except Exception:
+                badge_content = Text(badge_text)
             badge_panel = Panel(
-                Text.from_markup(badge_text),
+                badge_content,
                 box=box.ROUNDED,
                 border_style=theme["accent"],
                 padding=(0, 1)
@@ -3403,8 +3455,8 @@ class XDHApp:
                 folded_msg = f"[dim italic]Output collapsed ({len(output_content)} chars). Press Ctrl+O to expand.[/dim italic]"
                 blocks.append(render_rich_to_string(Text.from_markup(folded_msg), max_cols=cols))
             elif output_content and output_content not in ["[Exited with 0]", "None"]:
-                # If not in full collapsed_state, limit tool output box to 5 lines
-                clamped_out, was_truncated = clamp_to_lines(output_content, max_lines=5)
+                # Limit tool output box to 5 lines of screen height
+                clamped_out, was_truncated = clamp_to_lines(output_content, max_lines=5, screen_width=cols)
                 
                 if name == "replace_file_content":
                     try:
@@ -4195,21 +4247,23 @@ class XDHApp:
                         cols, _ = self.get_term_size()
 
                         # Live stream blocks preview
+                        # Live stream blocks preview
                         render_blocks = []
                         if accumulated_thought and self.harness.config.get("show_thinking"):
                             thought_lines = accumulated_thought.splitlines()
                             total_thought_lines = len(thought_lines)
-                            # Clamped to 5 lines during streaming as requested
+                            t_stream = Text()
                             if total_thought_lines > 5:
                                 preview_lines = thought_lines[-5:]
-                                preview_thought = f"… [dim](omitted first {total_thought_lines - 5} lines while streaming)[/dim]\n" + "\n".join(preview_lines)
+                                t_stream.append(f"… (omitted first {total_thought_lines - 5} lines while streaming)\n", style="dim")
+                                t_stream.append("\n".join(preview_lines), style=f"dim {theme['warning']}")
                                 title_extra = f" (line {total_thought_lines})"
                             else:
-                                preview_thought = accumulated_thought
+                                t_stream.append(accumulated_thought, style=f"dim {theme['warning']}")
                                 title_extra = ""
 
                             thought_panel = Panel(
-                                Text.from_markup(preview_thought) if preview_thought.startswith("… [dim]") else Text(preview_thought, style=f"dim {theme['warning']}"),
+                                t_stream,
                                 title=f"⚡ Thinking {turn_timestamp}{title_extra}",
                                 box=box.ROUNDED,
                                 border_style=theme["warning"],
@@ -4219,14 +4273,18 @@ class XDHApp:
 
                         if accumulated_content:
                             curr_model = self.harness.current_provider_data.get("default_model", "assistant")
-                            content_panel = Panel(
-                                Markdown(accumulated_content),
-                                title=f"xdh {turn_timestamp} ({curr_model})",
-                                box=box.ROUNDED,
-                                border_style=theme["primary"],
-                                padding=(0, 1)
-                            )
-                            render_blocks.append(render_rich_to_string(content_panel, max_cols=cols))
+                            # Strip tool_call and think tags from preview content for clean presentation
+                            disp_content = re.sub(r'<tool_call>.*?(?:</tool_call>|$)', '', accumulated_content, flags=re.DOTALL)
+                            disp_content = re.sub(r'</?think(?:ing)?>', '', disp_content).strip()
+                            if disp_content:
+                                content_panel = Panel(
+                                    Markdown(disp_content),
+                                    title=f"xdh {turn_timestamp} ({curr_model})",
+                                    box=box.ROUNDED,
+                                    border_style=theme["primary"],
+                                    padding=(0, 1)
+                                )
+                                render_blocks.append(render_rich_to_string(content_panel, max_cols=cols))
 
                         if render_blocks:
                             combined = "\n".join(render_blocks)
@@ -4246,6 +4304,60 @@ class XDHApp:
                 with self.lock:
                     self.stream_lines = []
 
+                # Sanitize accumulated content and extract any fallback embedded tool calls
+                final_tools_list = list(final_tools) if final_tools else []
+                cleaned_content = accumulated_content
+
+                if "<tool_call>" in accumulated_content:
+                    tool_matches = list(re.finditer(r'<tool_call>(.*?)(?:</tool_call>|$)', accumulated_content, re.DOTALL))
+                    for m in tool_matches:
+                        body = m.group(1).strip()
+                        if not body:
+                            continue
+                        try:
+                            parsed = json.loads(body)
+                            if isinstance(parsed, dict) and "name" in parsed:
+                                t_args = parsed.get("arguments", {})
+                                if isinstance(t_args, dict):
+                                    t_args = json.dumps(t_args)
+                                final_tools_list.append({
+                                    "id": self.harness.next_call_id(),
+                                    "type": "function",
+                                    "function": {"name": parsed["name"], "arguments": str(t_args)}
+                                })
+                                continue
+                        except Exception:
+                            pass
+
+                        fn_match = re.search(r'<function=([^\s>/]+)(.*)', body, re.DOTALL)
+                        if fn_match:
+                            raw_target = fn_match.group(1).strip()
+                            rest = fn_match.group(2).strip()
+                            if "." in raw_target:
+                                tname, first_arg = raw_target.split(".", 1)
+                                param_name = "path" if tname in ["list_dir", "read_file", "write_file"] else ("command" if tname == "bash" else "query")
+                                final_tools_list.append({
+                                    "id": self.harness.next_call_id(),
+                                    "type": "function",
+                                    "function": {"name": tname, "arguments": json.dumps({param_name: first_arg})}
+                                })
+                            else:
+                                tname = raw_target
+                                attrs = dict(re.findall(r'([a-zA-Z_]+)="([^"]*)"', rest))
+                                inner = re.search(r'>(.*?)(?:</function>|$)', rest, re.DOTALL)
+                                if inner and inner.group(1).strip() and not attrs:
+                                    param_name = "content" if tname == "write_file" else ("command" if tname == "bash" else "query")
+                                    attrs[param_name] = inner.group(1).strip()
+                                final_tools_list.append({
+                                    "id": self.harness.next_call_id(),
+                                    "type": "function",
+                                    "function": {"name": tname, "arguments": json.dumps(attrs)}
+                                })
+                    cleaned_content = re.sub(r'<tool_call>.*?(?:</tool_call>|$)', '', accumulated_content, flags=re.DOTALL).strip()
+
+                # Also strip any residual </think> or </thinking> tags
+                cleaned_content = re.sub(r'</?think(?:ing)?>', '', cleaned_content).strip()
+
                 curr_model = self.harness.current_provider_data.get("default_model", "assistant")
                 if accumulated_thought and self.harness.config.get("show_thinking"):
                     self.append_history_block({
@@ -4253,32 +4365,32 @@ class XDHApp:
                         "content": accumulated_thought,
                         "timestamp": turn_timestamp
                     })
-                if accumulated_content:
+                if cleaned_content:
                     self.append_history_block({
                         "type": "assistant",
-                        "content": accumulated_content,
+                        "content": cleaned_content,
                         "model": curr_model,
                         "timestamp": turn_timestamp
                     })
 
                 assistant_record: Dict[str, Any] = {
                     "role": "assistant",
-                    "content": accumulated_content if accumulated_content else None
+                    "content": cleaned_content if cleaned_content else None
                 }
                 if accumulated_thought:
                     assistant_record["reasoning_content"] = accumulated_thought
-                if final_tools:
-                    for tc in final_tools:
+                if final_tools_list:
+                    for tc in final_tools_list:
                         if not tc.get("id"):
                             tc["id"] = self.harness.next_call_id()
-                    assistant_record["tool_calls"] = final_tools
+                    assistant_record["tool_calls"] = final_tools_list
 
                 self.harness.messages.append(assistant_record)
 
-                if not final_tools or self.abort_requested:
+                if not final_tools_list or self.abort_requested:
                     break
 
-                for tc in final_tools:
+                for tc in final_tools_list:
                     if self.abort_requested:
                         break
 
@@ -4414,25 +4526,35 @@ class XDHApp:
                         if content_chunk:
                             while content_chunk:
                                 if inside_think_tag:
-                                    if "</think>" in content_chunk:
-                                        parts = content_chunk.split("</think>", 1)
-                                        if parts[0]:
-                                            yield ("thought", parts[0], None)
-                                        content_chunk = parts[1] if len(parts) > 1 else ""
+                                    m = re.search(r'</(think(?:ing)?)>', content_chunk, re.IGNORECASE)
+                                    if m:
+                                        before = content_chunk[:m.start()]
+                                        if before:
+                                            yield ("thought", before, None)
+                                        content_chunk = content_chunk[m.end():]
                                         inside_think_tag = False
                                     else:
                                         yield ("thought", content_chunk, None)
                                         content_chunk = ""
                                 else:
-                                    if "<think>" in content_chunk:
-                                        parts = content_chunk.split("<think>", 1)
-                                        if parts[0]:
-                                            yield ("content", parts[0], None)
-                                        content_chunk = parts[1] if len(parts) > 1 else ""
+                                    m = re.search(r'<(think(?:ing)?)>', content_chunk, re.IGNORECASE)
+                                    if m:
+                                        before = content_chunk[:m.start()]
+                                        if before:
+                                            yield ("content", before, None)
+                                        content_chunk = content_chunk[m.end():]
                                         inside_think_tag = True
                                     else:
-                                        yield ("content", content_chunk, None)
-                                        content_chunk = ""
+                                        # Also handle models emitting closing </think> or </thinking> without <think>
+                                        dangling = re.search(r'</(think(?:ing)?)>', content_chunk, re.IGNORECASE)
+                                        if dangling:
+                                            before = content_chunk[:dangling.start()]
+                                            if before:
+                                                yield ("thought", before, None)
+                                            content_chunk = content_chunk[dangling.end():]
+                                        else:
+                                            yield ("content", content_chunk, None)
+                                            content_chunk = ""
 
                     if stream_usage_tokens > 0:
                         self.harness.total_tokens_consumed += stream_usage_tokens
