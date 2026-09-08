@@ -72,4 +72,20 @@ When invoking `spawn_agents`:
 
 Long-running conversations automatically respect model context boundaries:
 - `count_context_tokens()` tracks approximate token usage against `context_window`.
-- When consumption crosses `compaction_threshold` (default `85%`), the compaction pipeline automatically summarizes earlier conversation turns while preserving critical system instructions, recent tool outputs, and user requests.
+- When consumption crosses `compaction_threshold` (default `85%`), the compaction pipeline triggers an LLM summarization turn over pruned messages, extracting:
+  1. Key user decisions, goals, and constraints.
+  2. Files read, created, or modified.
+  3. Actionable next steps and unresolved tasks.
+- If the LLM call fails or times out, an extractive fallback preserves every user request and tool action, ensuring zero memory loss across long pairing sessions.
+
+---
+
+## 🔒 Security Hardening & Zero-Trust Architecture
+
+v1.0.9 implements comprehensive multi-layer safety controls:
+- **AST Plugin Verification**: Before loading any plugin module dynamically, `PluginManager.scan_plugin_safety` parses the file with Python's `ast` module, checking against unauthorized system invocations (`os.system`, `subprocess`, `shutil.rmtree`) and risky dynamic execution (`eval`, `exec`).
+- **Session Path Traversal Guard**: All session loading, saving, and deletion operations validate target paths using `Path.resolve().relative_to(SESSION_DIR)`, strictly neutralizing directory traversal payloads like `../../etc/cron.d`.
+- **Zero-Trust SSRF Protection**: `fetch_url` verifies target hostnames via DNS resolution prior to HTTP requests, rejecting private (RFC 1918), loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`), and reserved IP addresses.
+- **Universal Mutation Guard**: Prohibits writes and replacements targeting critical operating system directories (`/etc`, `/boot`, `/system`, `/proc`, `/sys`) and sensitive configuration dotfiles (`.git`, `.ssh`, `.env`, `.bashrc`).
+- **Prompt Injection Quarantine**: Rules discovered in `.xdhrules` or `.cursorrules` are scrubbed of non-printable control characters and wrapped in isolated advisory tags to prevent untrusted instruction overrides.
+- **Persistent Shell State Tracking**: Background `bash` executions capture working directory transitions (`pwd`) to ensure paths consistently resolve against `harness.current_cwd`.

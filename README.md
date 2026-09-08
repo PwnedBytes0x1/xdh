@@ -25,7 +25,7 @@
   ╚██╗██╔╝██╔══██╗██║  ██║
    ╚███╔╝ ██║  ██║███████║
    ██╔██╗ ██║  ██║██╔══██║
-  ██╔╝ ██╗██████╔╝██║  ██║   xdharness v1.0.7
+  ██╔╝ ██╗██████╔╝██║  ██║   xdharness v1.0.9
 ```
 
 ---
@@ -33,6 +33,11 @@
 ## 🚀 Features
 
 - 🖥️ **3-Segment Layout & Responsive Drawer**: Real-time context header (tokens, RAM, latency, provider/model), scrollable history viewport with collapsible blocks, sidecar drawer panel (`F2` / `Ctrl+B`), and dynamic multi-line composer.
+- 🔒 **Fortified Security & AST Plugin Scanner**: Pre-execution AST security validation for plugins blocking dangerous system calls, strict path traversal guards on session IDs, and zero-trust SSRF protection in `fetch_url` blocking private, link-local, and loopback IPs.
+- 🐚 **Persistent Shell State**: Working directory persists across autonomous `bash` command executions (`cd` transitions tracked in `harness.current_cwd`) and all file tool paths resolve against it.
+- 🛡️ **Universal Mutation Safety Guards**: Comprehensive protection against unauthorized destructive modifications to critical system paths (`/etc`, `/boot`, `/system`, `.git`, `.ssh`, `.env`).
+- 🔍 **Semantic BM25 / TF-IDF Search**: Score-ranked semantic and keyword relevance search for `/index build` and `/index query`.
+- 🧠 **True Context Compaction & Summarization**: LLM-driven structured bullet summarization of pruned turns preserving goal progress, file states, and user intent.
 - ⚡ **Headless & Pipe Mode**: Full CLI non-interactive operation (`xdh -p "prompt"`, `--pipe`, `cat file | xdh -p "..." > out`) without launching the full TUI.
 - 🛡️ **Configurable Permission Modes**: `--safe` (strict confirmation on state changes), `--auto` (default guard against destructive commands), and `--yolo` (unconstrained speed).
 - 🔌 **Model Context Protocol (MCP)**: Native stdio JSON-RPC 2.0 MCP client integration. Configure servers in `~/.xdharness/mcp.json` or `/mcp add`, with automatic dynamic tool discovery.
@@ -42,14 +47,13 @@
 - ⏰ **Autonomous Task Scheduling**: Schedule recurring autonomous agent triggers via `/schedule <interval_sec> <task>`.
 - 🎯 **Reusable Skills System**: Built-in `create_skill` & `call_skill` engine. Define, discover, and run skills via `/skill list`, `/skill run <name>`, or autonomous agent calls.
 - 🤖 **Multi-Agent Orchestration**: Built-in `create_agent` & `spawn_agents`. Launch multiple specialized subagents concurrently in parallel threads to solve tasks cooperatively.
-- 🔌 **Dynamic Plugin Management**: Add, install from git repositories, delete, and manage community or personal plugins via `/plugin`.
+- 🔌 **Dynamic Plugin Management**: Add, install from git repositories, delete, and manage community or personal plugins via `/plugin` with automated AST safety verification.
 - ❓ **Interactive User Question Prompting**: Agents can invoke `ask_question` with selectable options to clarify ambiguity during execution.
 - ⚡ **Mid-Run User Guidance Interruption**: Send a message or press `ESC` / `Ctrl+C` while an agent is executing to immediately pause, incorporate guidance, and pivot smoothly.
 - 🛡️ **Fault-Tolerant Resilience**: 5-stage connection retry backoff with automatic provider failover.
-- ♾️ **Unconstrained Autonomous Execution**: Removed artificial tool round limits for complex pipelines.
+- ♾️ **Unconstrained Autonomous Execution**: Continuous multi-step reasoning without artificial iteration bounds.
 - 🎨 **Curated Color Palettes**: `tokyo_night`, `dracula`, `catppuccin`, `monokai`, `nord`, `cyberpunk`, `gruvbox`, and `solarized`.
 - 📱 **Mobile & Termux First**: Smooth step-scroll animation for touch gestures, compact mini-banners for narrow viewports (<70 cols), and zero heavy C-extension dependencies.
-- 🧠 **Context Optimization**: Automatic message history compaction when nearing token capacity thresholds.
 
 ---
 

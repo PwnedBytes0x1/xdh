@@ -8,11 +8,11 @@
 
 | Tool Name | Scope | Description |
 | :--- | :--- | :--- |
-| `bash` | System | Executes shell commands in workspace with non-blocking timeout handling and truncation. |
-| `read_file` | Filesystem | Reads full files or specific line ranges (`start_line`, `end_line`) with smart encoding detection. |
-| `write_file` | Filesystem | Writes or overwrites files on disk with automatic parent directory creation and backup snapshots. |
+| `bash` | System | Executes shell commands in workspace with persistent working directory (`cd` state), non-blocking timeout handling, and output truncation. |
+| `read_file` | Filesystem | Reads full files or specific line ranges (`start_line`, `end_line`) resolved against persistent working directory. |
+| `write_file` | Filesystem | Writes or overwrites files on disk with mutation safety guards protecting critical system and dotfile locations. |
 | `find_by_name` | Filesystem | Searches for files and directories matching glob patterns, filtered by `.xdhignore` / `.gitignore`. |
-| `replace_file_content` | Codebase | Performs surgical line replacements matching exact target content chunks. |
+| `replace_file_content` | Codebase | Performs surgical line replacements with mutation safety guards protecting system paths. |
 | `list_dir` | Filesystem | Lists directory entries with file sizes, types, and recursive directory counts. |
 | `grep_search` | Codebase | Fast regex and literal pattern matching across project files (accelerated by `ripgrep` when available). |
 | `file_info` | Filesystem | Retrieves file metadata including size, permissions, line count, and last modification timestamp. |
@@ -22,14 +22,14 @@
 | `git_diff` | Version Control | Generates unified git diffs for staged or unstaged workspace modifications. |
 | `git_commit` | Version Control | Stages modified files and creates git commits with specified commit messages. |
 | `manage_checkpoint` | Version Control | Creates named workspace snapshots and restores previous checkpoints instantly (`create`, `restore`, `list`). |
-| `fetch_url` | Network | Fetches web pages or APIs over HTTP/HTTPS, extracting plain text / markdown payloads. |
+| `fetch_url` | Network | Fetches web pages or APIs over HTTP/HTTPS with zero-trust SSRF protection blocking private, link-local, and loopback IPs. |
 | `search_web` | Internet | Performs live web searches via DuckDuckGo and aggregates contextual result snippets. |
 | `bg_command` | Background | Launches persistent background tasks (`start`, `status`, `logs`, `kill`) without blocking execution. |
 | `create_skill` | Extensibility | Persists reusable agent instructions and behavioral protocols to `~/.xdharness/skills/<name>.md`. |
 | `call_skill` | Extensibility | Reads and executes defined skills, injecting domain-specific prompts directly into context. |
 | `create_agent` | Multi-Agent | Defines custom specialized subagent profiles with custom system prompts and authorized toolsets. |
 | `spawn_agents` | Multi-Agent | Spawns multiple subagents concurrently in parallel threads to solve cooperative sub-tasks. |
-| `manage_plugins` | Extensibility | Manages dynamic plugins (`list`, `install`, `delete`, `info`) from local directories or GitHub repositories. |
+| `manage_plugins` | Extensibility | Manages dynamic plugins (`list`, `install`, `delete`, `info`) with pre-load AST static security verification against arbitrary code execution. |
 | `manage_mcp` | MCP | Manages Model Context Protocol servers (`list`, `add`, `remove`, `ping`, `tools`) over stdio JSON-RPC 2.0. |
 | `ask_question` | Interactive | Solicits interactive user feedback or picks from options during autonomous agent runs. |
 
