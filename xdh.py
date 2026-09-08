@@ -6,7 +6,7 @@ Features: 3-Segment Layout, Micro-Action Badges, Context Ghost-Suggest,
 Dynamic Expanding Composer, and Interactive Settings.
 """
 
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 import os
 import sys
@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
 # Rich imports
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.markdown import Markdown
@@ -615,19 +615,24 @@ class XDHarness:
         self.save_session()
         return next_id
 
-    def toggle_todo(self, todo_id: int) -> bool:
+    def toggle_todo(self, todo_id: int) -> Tuple[bool, str, bool]:
+        """Toggles todo state. Returns (found, title, new_done_state)."""
         for t in self.todos:
             if t["id"] == todo_id:
                 t["done"] = not t["done"]
                 self.save_session()
-                return True
-        return False
+                return True, t.get("title", f"Task #{todo_id}"), t["done"]
+        return False, "", False
 
-    def delete_todo(self, todo_id: int) -> bool:
-        initial_len = len(self.todos)
-        self.todos = [t for t in self.todos if t["id"] != todo_id]
-        self.save_session()
-        return len(self.todos) < initial_len
+    def delete_todo(self, todo_id: int) -> Tuple[bool, str]:
+        """Deletes todo by id. Returns (found, title)."""
+        for i, t in enumerate(self.todos):
+            if t["id"] == todo_id:
+                title = t.get("title", f"Task #{todo_id}")
+                self.todos.pop(i)
+                self.save_session()
+                return True, title
+        return False, ""
 
     def clear_todos(self):
         self.todos = []
@@ -738,6 +743,44 @@ class XDHarness:
         self.session_id = new_sid
         self.save_session()
         return new_sid
+
+    def new_session(self) -> str:
+        """Resets the harness and starts a fresh, clean conversation session."""
+        self.save_session()
+        self.session_id = time.strftime("sess_%m%d_%H%M%S")
+        sys_prompt = "You are xdh, an expert terminal coding agent. Be concise, precise, and practical."
+        sys_prompt += f"\n\n[Runtime & System Environment]:\n{get_system_environment_info()}"
+        for rf in [Path(".xdhrules"), Path(".cursorrules"), Path.home() / ".xdhrules"]:
+            if rf.is_file():
+                try:
+                    rules_content = rf.read_text(encoding="utf-8", errors="replace").strip()
+                    if rules_content:
+                        sys_prompt += f"\n\n[Project Rules from {rf.name}]:\n{rules_content}"
+                        break
+                except Exception:
+                    pass
+        self.messages = [{"role": "system", "content": sys_prompt}]
+        self.total_tokens_consumed = 0
+        self._call_counter = 0
+        self.todos = []
+        self.scratchpad = ""
+        self.save_session()
+        return self.session_id
+
+    def delete_session(self, sid: str) -> bool:
+        """Deletes a saved session file by session ID or partial match."""
+        fpath = SESSIONS_DIR / f"{sid}.json"
+        if not fpath.exists():
+            matches = list(SESSIONS_DIR.glob(f"*{sid}*.json"))
+            if matches:
+                fpath = matches[0]
+            else:
+                return False
+        try:
+            fpath.unlink(missing_ok=True)
+            return True
+        except Exception:
+            return False
 
 # ---------------------------------------------------------
 # Skills System (Load, Create, Call)
@@ -2094,8 +2137,10 @@ def execute_tool(name: str, args: Dict[str, Any], harness: XDHarness) -> Tuple[s
                 return "Error: No task provided.", "📋 Task  › [red]Add Failed[/red]"
             elif act == "done":
                 tid = args.get("todo_id", 0)
-                if harness.toggle_todo(tid):
-                    return f"Toggled task #{tid}", f"📋 Task  › [yellow]✓ #{tid} done[/yellow]"
+                ok, title, is_done = harness.toggle_todo(tid)
+                if ok:
+                    st_word = "Completed" if is_done else "Reopened"
+                    return f"{st_word} task #{tid}: {title}", f"📋 Task  › [yellow]✓ #{tid} {title[:20]}[/yellow]"
                 return f"Task #{tid} not found.", f"📋 Task  › [red]#{tid} missing[/red]"
             elif act == "list":
                 if not harness.todos:
@@ -2489,7 +2534,8 @@ SLASH_COMMANDS = {
     "/theme": "Switch palette (/theme <name>)",
     "/tools": "Toggle tools (/tools on|off)",
     "/thinking": "Toggle thoughts stream (/thinking on|off)",
-    "/session": "Session statistics, list, or load (/session list|load)",
+    "/session": "Session management (/session new|list|load|del|fork|stats)",
+    "/new": "Start a clean new conversation session (or /session new)",
     "/history": "View recent prompt history",
     "/copy": "Copy last response or code block to system clipboard",
     "/undo": "Revert the most recent file edit from backups",
@@ -2626,7 +2672,7 @@ class XDHCompleter(Completer):
                         yield Completion(opt, start_position=-len(typed))
             elif cmd == "/session":
                 typed = parts[1] if len(parts) > 1 else ""
-                for opt in ["stats", "list", "load"]:
+                for opt in ["new", "list", "load", "del", "delete", "fork", "stats"]:
                     if opt.startswith(typed):
                         yield Completion(opt, start_position=-len(typed))
             elif cmd == "/skill":
@@ -2704,6 +2750,7 @@ class XDHApp:
         self.staged_diffs: List[Dict[str, str]] = []
         self.drawer_open: bool = False
         self.active_schedules: List[Dict[str, Any]] = []
+        self.live_stream_tokens: int = 0
         self._spinner_thread: Optional[threading.Thread] = None
 
         # Segment 1: Fixed Top Banner Window
@@ -3225,7 +3272,7 @@ class XDHApp:
         cols, _ = self.get_term_size()
         pdata = self.harness.current_provider_data
         ctx_max = pdata.get("context_window", 128000) or 128000
-        current_tokens = self.harness.count_context_tokens()
+        current_tokens = self.harness.count_context_tokens() + self.live_stream_tokens
         pct = min(100, int((current_tokens / ctx_max) * 100))
         ram = get_memory_usage_mb()
 
@@ -3233,7 +3280,8 @@ class XDHApp:
         model = pdata.get("default_model", "none")
 
         ctx_str = format_k_val(ctx_max)
-        tok_str = format_k_val(self.harness.total_tokens_consumed)
+        total_tokens_now = self.harness.total_tokens_consumed + self.live_stream_tokens
+        tok_str = format_k_val(total_tokens_now)
         tools_st = "ON" if self.harness.config.get("active_tools") else "OFF"
 
         # Status badge with spinner when busy (time-based for smooth non-laggy rotation)
@@ -3404,10 +3452,10 @@ class XDHApp:
                 raw_lines = thought_text.splitlines()
                 inner_w = max(20, cols - 4)
                 total_screen_lines = sum(max(1, (len(l) + inner_w - 1) // inner_w) if len(l) > 0 else 1 for l in raw_lines)
-                
-                t = Text()
+
+                hint_text = None
                 if total_screen_lines <= 5:
-                    t.append(thought_text, style=f"dim {theme['warning']}")
+                    body_md = Markdown(thought_text)
                 else:
                     accumulated_screen = 0
                     kept_raw = []
@@ -3423,11 +3471,12 @@ class XDHApp:
                                 kept_raw.append(l[:rem_budget * inner_w])
                             break
                     rem_lines = max(1, total_screen_lines - 5)
-                    t.append(f"… (+{rem_lines} more lines, Ctrl+O to expand)\n", style="dim")
-                    t.append("\n".join(kept_raw), style=f"dim {theme['warning']}")
+                    hint_text = Text(f"… (+{rem_lines} more lines, Ctrl+O to expand)", style="dim")
+                    body_md = Markdown("\n".join(kept_raw))
 
+                content_renderable = Group(hint_text, body_md) if hint_text else body_md
                 panel = Panel(
-                    t,
+                    content_renderable,
                     title=f"⚡ Thinking{time_str}",
                     box=box.ROUNDED,
                     border_style=theme["warning"],
@@ -3659,15 +3708,24 @@ class XDHApp:
                 new_id = self.harness.add_todo(task_str)
                 self.append_output(f"✓ Added task #{new_id}: {task_str}")
             elif len(parts) >= 3 and parts[1] == "done":
-                if parts[2].isdigit() and self.harness.toggle_todo(int(parts[2])):
-                    self.append_output(f"✓ Updated task #{parts[2]}")
+                if parts[2].isdigit():
+                    ok, title, is_done = self.harness.toggle_todo(int(parts[2]))
+                    if ok:
+                        st_word = "Completed" if is_done else "Reopened"
+                        self.append_output(f"✓ {st_word} task #{parts[2]}: \"{title}\"")
+                    else:
+                        self.append_output(f"Task #{parts[2]} not found.")
                 else:
-                    self.append_output(f"Task #{parts[2]} not found.")
+                    self.append_output(f"Invalid task ID: {parts[2]}")
             elif len(parts) >= 3 and parts[1] == "del":
-                if parts[2].isdigit() and self.harness.delete_todo(int(parts[2])):
-                    self.append_output(f"✓ Deleted task #{parts[2]}")
+                if parts[2].isdigit():
+                    ok, title = self.harness.delete_todo(int(parts[2]))
+                    if ok:
+                        self.append_output(f"✓ Deleted task #{parts[2]}: \"{title}\"")
+                    else:
+                        self.append_output(f"Task #{parts[2]} not found.")
                 else:
-                    self.append_output(f"Task #{parts[2]} not found.")
+                    self.append_output(f"Invalid task ID: {parts[2]}")
             elif len(parts) >= 2 and parts[1] == "clear":
                 self.harness.clear_todos()
                 self.append_output("✓ Cleared all tasks.")
@@ -3801,6 +3859,17 @@ class XDHApp:
             except Exception as e:
                 self.append_output(f"[red]Export failed: {str(e)}[/red]")
 
+        elif root in ["/new", "/session"] and (root == "/new" or (len(parts) > 1 and parts[1].lower() == "new")):
+            sid = self.harness.new_session()
+            with self.lock:
+                self.history_blocks = []
+                self.buffer_text = ""
+                self.base_lines = []
+                self.stream_lines = []
+                self.scroll_offset = 0
+            self.rebuild_buffer_text()
+            self.append_output(f"✓ Started fresh session [bold green]{sid}[/bold green]. Context cleared.")
+
         elif root == "/session":
             sub = parts[1].lower() if len(parts) > 1 else "stats"
             if sub == "list":
@@ -3835,6 +3904,14 @@ class XDHApp:
                     self.history_blocks = new_blocks
                     self.rebuild_buffer_text()
                     self.append_output(f"✓ Loaded session [bold green]{self.harness.session_id}[/bold green]. Context & buffer restored.")
+                else:
+                    self.append_output(f"[red]Session '{target_id}' not found.[/red]")
+            elif sub in ["del", "delete"] and len(parts) >= 3:
+                target_id = parts[2]
+                if self.harness.delete_session(target_id):
+                    self.append_output(f"✓ Deleted session [bold yellow]{target_id}[/bold yellow].")
+                else:
+                    self.append_output(f"[red]Session '{target_id}' not found.[/red]")
             elif sub == "fork" and len(parts) >= 3:
                 fork_tag = parts[2]
                 new_sid = self.harness.fork_session(fork_tag)
@@ -4241,6 +4318,7 @@ class XDHApp:
                         final_tools = tool_calls
 
                     now = time.time()
+                    self.live_stream_tokens = max(0, (len(accumulated_thought) + len(accumulated_content)) // 4)
                     is_final = (token_type == "done")
                     if (now - last_ui_update >= 0.10) or is_final:
                         last_ui_update = now
@@ -4252,18 +4330,19 @@ class XDHApp:
                         if accumulated_thought and self.harness.config.get("show_thinking"):
                             thought_lines = accumulated_thought.splitlines()
                             total_thought_lines = len(thought_lines)
-                            t_stream = Text()
+                            hint_stream = None
                             if total_thought_lines > 5:
                                 preview_lines = thought_lines[-5:]
-                                t_stream.append(f"… (omitted first {total_thought_lines - 5} lines while streaming)\n", style="dim")
-                                t_stream.append("\n".join(preview_lines), style=f"dim {theme['warning']}")
+                                hint_stream = Text(f"… (omitted first {total_thought_lines - 5} lines while streaming)", style="dim")
+                                body_stream = Markdown("\n".join(preview_lines))
                                 title_extra = f" (line {total_thought_lines})"
                             else:
-                                t_stream.append(accumulated_thought, style=f"dim {theme['warning']}")
+                                body_stream = Markdown(accumulated_thought)
                                 title_extra = ""
 
+                            content_stream = Group(hint_stream, body_stream) if hint_stream else body_stream
                             thought_panel = Panel(
-                                t_stream,
+                                content_stream,
                                 title=f"⚡ Thinking {turn_timestamp}{title_extra}",
                                 box=box.ROUNDED,
                                 border_style=theme["warning"],
@@ -4303,6 +4382,7 @@ class XDHApp:
                 # Clear active stream lines and append finalized blocks to history
                 with self.lock:
                     self.stream_lines = []
+                self.live_stream_tokens = 0
 
                 # Sanitize accumulated content and extract any fallback embedded tool calls
                 final_tools_list = list(final_tools) if final_tools else []
@@ -4441,6 +4521,7 @@ class XDHApp:
             self.harness.status_label = "Ready"
             self.is_busy = False
             self.abort_requested = False
+            self.live_stream_tokens = 0
             self._stop_spinner_ticker()
 
     def harness_stream_call(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None):
